@@ -86,9 +86,9 @@ def bounded_decision(event: dict[str, Any], probability: float) -> Decision:
         reason = "High-value payment actions are bounded by a human-approval threshold in the MVP."
         delay = 0
 
-    if prior_contacts >= 3 and action == "send_recovery_message":
+    if prior_contacts >= 3 and action in {"send_recovery_message", "retry_payment", "send_payment_update", "send_payment_link"}:
         action = "escalate"
-        reason = "The customer has already received multiple contacts, so the bounded policy stops automated messaging."
+        reason = "The customer has already received multiple contacts, so the bounded policy stops further automated intervention."
         delay = 0
 
     risk_reason = f"{event_type.replace('_', ' ').title()} for ₹{amount:,.0f}; recovery probability {probability:.0%}."
