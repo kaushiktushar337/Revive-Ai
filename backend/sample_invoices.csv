@@ -1,0 +1,4 @@
+customer,amount,due_date,invoice_id,currency,previous_success_rate,customer_value,prior_contacts,days_since_last_success
+ABC Pvt Ltd,75000,2026-08-15,INV-1001,INR,0.80,300000,1,12
+Rahul Sharma,18500,2026-08-10,INV-1002,INR,0.86,74000,0,5
+Northstar Studio,120000,2026-08-22,INV-1003,INR,0.92,480000,2,8

@@ -17,7 +17,7 @@ from pydantic import BaseModel, Field
 from config import APP_ENV, CORS_ORIGINS, RAZORPAY_KEY_ID, RAZORPAY_WEBHOOK_SECRET
 from engine import bounded_decision
 from model import predict_probability
-from razorpay_adapter import create_payment_link, verify_webhook_signature
+from razorpay_adapter import create_payment_link, test_connection, verify_webhook_signature
 
 BASE = Path(__file__).resolve().parent
 DB = BASE / "revive.db"
@@ -119,6 +119,17 @@ def init_db():
             event_id TEXT
         )"""
     )
+    conn.execute(
+        """CREATE TABLE IF NOT EXISTS webhook_events (
+            id TEXT PRIMARY KEY,
+            source TEXT NOT NULL,
+            event_name TEXT NOT NULL,
+            external_id TEXT,
+            received_at TEXT NOT NULL,
+            payload TEXT NOT NULL
+        )"""
+    )
+    conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_webhook_external_id ON webhook_events(source, external_id) WHERE external_id IS NOT NULL")
     conn.commit()
     conn.close()
 
@@ -180,22 +191,30 @@ def event_payload_to_internal(payload: dict[str, Any], source: str = "razorpay")
     if not entity:
         entity = (((payload.get("payload") or {}).get("payment_link") or {}).get("entity") or {})
 
+    amount = float(entity.get("amount") or 0) / 100
+    customer = entity.get("email") or entity.get("contact") or "Razorpay Customer"
+    external_id = entity.get("id")
+    common = {
+        "customer": customer,
+        "amount": amount,
+        "currency": entity.get("currency") or "INR",
+        "external_id": external_id,
+        "source": source,
+        "previous_success_rate": 0.75,
+        "customer_value": amount * 4,
+        "event_age_hours": 0.2,
+        "days_since_last_success": 7,
+        "prior_contacts": 0,
+        "is_subscription": bool(entity.get("subscription_id")),
+    }
     if event_name in {"payment.failed", "order.payment_failed"}:
         return {
+            **common,
             "event_type": "payment_failed",
-            "customer": entity.get("email") or entity.get("contact") or "Razorpay Customer",
-            "amount": float(entity.get("amount") or 0) / 100,
-            "currency": entity.get("currency") or "INR",
-            "external_id": entity.get("id"),
-            "source": source,
             "failure_reason": entity.get("error_reason") or entity.get("error_description") or "temporary_decline",
-            "previous_success_rate": 0.75,
-            "customer_value": float(entity.get("amount") or 0) / 100 * 4,
-            "event_age_hours": 0.2,
-            "days_since_last_success": 7,
-            "prior_contacts": 0,
-            "is_subscription": bool(entity.get("subscription_id")),
         }
+    if event_name in {"payment.captured", "order.paid", "payment.authorized"}:
+        return {**common, "event_type": "payment_captured"}
     return None
 
 
@@ -220,6 +239,11 @@ def health():
         "environment": APP_ENV,
         "razorpay": {"configured": bool(RAZORPAY_KEY_ID), "webhook_verification": bool(RAZORPAY_WEBHOOK_SECRET)},
     }
+
+
+@app.get("/api/integrations/razorpay/test")
+def razorpay_test_connection():
+    return test_connection()
 
 
 @app.get("/api/dashboard")
@@ -338,23 +362,52 @@ async def razorpay_webhook(request: Request, x_razorpay_signature: str | None = 
     raw = await request.body()
     if RAZORPAY_WEBHOOK_SECRET and not verify_webhook_signature(raw, x_razorpay_signature or "", RAZORPAY_WEBHOOK_SECRET):
         raise HTTPException(status_code=401, detail="Invalid Razorpay webhook signature")
-    if not RAZORPAY_WEBHOOK_SECRET:
-        # Development/demo only. Production should always configure a webhook secret.
-        pass
 
     try:
         payload = json.loads(raw.decode("utf-8"))
     except json.JSONDecodeError as exc:
         raise HTTPException(status_code=400, detail="Invalid JSON") from exc
 
+    event_name = payload.get("event", "unknown")
+    payload_entity = (((payload.get("payload") or {}).get("payment") or {}).get("entity") or {})
+    payment_external_id = payload_entity.get("id")
+    webhook_external_id = payload.get("id") or f"wh_{uuid.uuid4().hex[:10]}"
+
+    conn = db()
+    existing = conn.execute("SELECT id FROM webhook_events WHERE source=? AND external_id=?", ("razorpay", webhook_external_id)).fetchone()
+    if not existing:
+        conn.execute(
+            "INSERT OR IGNORE INTO webhook_events(id,source,event_name,external_id,received_at,payload) VALUES(?,?,?,?,?,?)",
+            (webhook_external_id, "razorpay", event_name, webhook_external_id, datetime.now(timezone.utc).isoformat(), json.dumps(payload)),
+        )
+        conn.commit()
+    conn.close()
+
+    if existing:
+        return {"ok": True, "deduplicated": True, "event": event_name, "external_id": payment_external_id}
+
     internal = event_payload_to_internal(payload)
     if not internal or internal.get("amount", 0) <= 0:
-        return {"ok": True, "ignored": True, "reason": "Unsupported event"}
+        audit(None, "webhook", "ignored", f"Unsupported Razorpay event {event_name}.")
+        return {"ok": True, "ignored": True, "reason": "Unsupported event", "event": event_name}
+
+    # Captured payments are reconciliation events, not new revenue-risk opportunities.
+    if internal["event_type"] == "payment_captured":
+        conn = db()
+        row = conn.execute("SELECT id FROM events WHERE external_id=? ORDER BY created_at DESC LIMIT 1", (internal.get("external_id"),)).fetchone()
+        if row:
+            conn.execute("UPDATE events SET action_status='recovered', recovered=1 WHERE id=?", (row["id"],))
+            conn.commit()
+            conn.close()
+            audit(row["id"], "payment_reconciled", "recovered", f"Razorpay {event_name} reconciled the payment.")
+            return {"ok": True, "reconciled": True, "event_id": row["id"], "event": event_name}
+        conn.close()
+        return {"ok": True, "reconciled": False, "event": event_name, "reason": "No matching risk event"}
 
     decision = hydrate(internal)
     event_id = insert_event(internal, decision)
-    audit(event_id, "webhook", "ingested", f"Razorpay event {payload.get('event')} ingested.")
-    return {"ok": True, "event_id": event_id, "recommended_action": decision.recommended_action}
+    audit(event_id, "webhook", "ingested", f"Razorpay event {event_name} ingested.")
+    return {"ok": True, "event_id": event_id, "recommended_action": decision.recommended_action, "recovery_probability": decision.recovery_probability}
 
 
 @app.post("/api/checkout/events")
