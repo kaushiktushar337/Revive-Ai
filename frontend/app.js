@@ -187,6 +187,17 @@ document.querySelector('#simulateCheckoutBtn').addEventListener('click', async (
   } catch (err) { showError(err.message); }
 });
 
+document.querySelector('#testRazorpayBtn').addEventListener('click', async () => {
+  const result = document.querySelector('#razorpayTestResult');
+  result.textContent = 'Testing read-only Razorpay API connection…';
+  try {
+    const out = await request('/integrations/razorpay/test');
+    result.textContent = out.ok ? 'Razorpay connection verified.' : (out.message || `Connection failed (${out.status_code || 'unknown'})`);
+  } catch (err) {
+    result.textContent = err.message;
+  }
+});
+
 document.querySelector('#uploadInvoiceBtn').addEventListener('click', async () => {
   const file = document.querySelector('#invoiceFile').files[0];
   if (!file) { document.querySelector('#uploadResult').textContent = 'Choose a CSV file first.'; return; }

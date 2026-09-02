@@ -27,6 +27,34 @@ def _auth_header() -> str:
     return "Basic " + base64.b64encode(token).decode("ascii")
 
 
+def _request(method: str, path: str, **kwargs: Any) -> requests.Response:
+    return requests.request(
+        method,
+        f"{RAZORPAY_BASE_URL.rstrip('/')}/{path.lstrip('/')}",
+        headers={
+            "Authorization": _auth_header(),
+            "Content-Type": "application/json",
+            **kwargs.pop("headers", {}),
+        },
+        timeout=15,
+        **kwargs,
+    )
+
+
+def test_connection() -> dict[str, Any]:
+    """Verify Razorpay test credentials using a read-only API call."""
+    if not RAZORPAY_KEY_ID or not RAZORPAY_KEY_SECRET:
+        return {"configured": False, "ok": False, "mode": "demo", "message": "Razorpay credentials are not configured."}
+    response = _request("GET", "/payments", params={"count": 1})
+    if response.ok:
+        return {"configured": True, "ok": True, "mode": "live-test-api", "status_code": response.status_code}
+    try:
+        detail = response.json()
+    except ValueError:
+        detail = {"error": response.text[:300]}
+    return {"configured": True, "ok": False, "mode": "live-test-api", "status_code": response.status_code, "detail": detail}
+
+
 def create_payment_link(amount_inr: float, customer: str, description: str, reference_id: str) -> dict[str, Any]:
     """Create a Razorpay payment link, or return a deterministic demo link in mock mode."""
     if MOCK_EXTERNAL_ACTIONS or not RAZORPAY_KEY_ID or not RAZORPAY_KEY_SECRET:
@@ -45,11 +73,6 @@ def create_payment_link(amount_inr: float, customer: str, description: str, refe
         "notify": {"sms": False, "email": False},
         "reminder_enable": True,
     }
-    response = requests.post(
-        f"{RAZORPAY_BASE_URL}/payment_links",
-        json=payload,
-        headers={"Authorization": _auth_header(), "Content-Type": "application/json"},
-        timeout=15,
-    )
+    response = _request("POST", "/payment_links", json=payload)
     response.raise_for_status()
     return response.json()

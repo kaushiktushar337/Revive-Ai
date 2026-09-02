@@ -76,6 +76,10 @@
             <h3>Razorpay webhook</h3>
             <p>POST payment events directly to <code>/api/webhooks/razorpay</code>. Configure a webhook secret for signature verification.</p>
             <span id="razorpayStatus" class="status-pill">Checking…</span>
+            <div class="button-row" style="margin-top:14px">
+              <button id="testRazorpayBtn" class="action-btn">Test Razorpay connection</button>
+            </div>
+            <div id="razorpayTestResult" class="source-result"></div>
           </div>
           <div class="small-card">
             <div class="source-icon">CSV</div>
