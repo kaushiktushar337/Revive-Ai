@@ -1,0 +1,92 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Revive — AI Revenue Recovery</title>
+  <link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+  <div class="app-shell">
+    <aside class="sidebar">
+      <div class="brand"><span class="brand-mark">R</span><span>REVIVE</span></div>
+      <div class="tagline">AI revenue recovery agent</div>
+      <nav>
+        <button class="nav-item active" data-view="overview">Overview</button>
+        <button class="nav-item" data-view="risk">Revenue at Risk</button>
+        <button class="nav-item" data-view="recovery">Recovery Actions</button>
+        <button class="nav-item" data-view="audit">Audit Trail</button>
+      </nav>
+      <div class="sidebar-bottom">
+        <div class="connection"><span class="dot"></span> Demo environment</div>
+        <button id="resetBtn" class="ghost-btn">Reset demo data</button>
+      </div>
+    </aside>
+
+    <main class="main">
+      <header class="topbar">
+        <div>
+          <div class="eyebrow">REVENUE INTELLIGENCE</div>
+          <h1>Find revenue that's slipping away.</h1>
+          <p>Detect. Diagnose. Decide. Recover.</p>
+        </div>
+        <button id="simulateBtn" class="primary-btn">＋ Simulate revenue leak</button>
+      </header>
+
+      <section id="overview" class="view active-view">
+        <div class="metrics-grid">
+          <div class="metric-card"><div class="metric-label">Revenue at risk</div><div id="riskMetric" class="metric-value">₹0</div><div class="metric-note">Open recovery opportunities</div></div>
+          <div class="metric-card"><div class="metric-label">Expected recovery</div><div id="expectedMetric" class="metric-value">₹0</div><div class="metric-note">Model-estimated opportunity</div></div>
+          <div class="metric-card"><div class="metric-label">Recovered</div><div id="recoveredMetric" class="metric-value">₹0</div><div class="metric-note">Demo actions executed</div></div>
+          <div class="metric-card"><div class="metric-label">Events analyzed</div><div id="eventsMetric" class="metric-value">0</div><div class="metric-note">Across supported workflows</div></div>
+        </div>
+
+        <div class="section-grid">
+          <section class="panel large-panel">
+            <div class="panel-head"><div><h2>Highest-priority revenue leaks</h2><p>AI-ranked by recovery opportunity and bounded policy.</p></div><span class="chip">LIVE</span></div>
+            <div id="eventTable" class="event-list"></div>
+          </section>
+
+          <section class="panel agent-panel">
+            <div class="panel-head"><div><h2>Agent decision</h2><p>Latest recommendation</p></div></div>
+            <div id="agentEmpty" class="empty-state">Simulate an event to see the agent reason through a recovery action.</div>
+            <div id="agentDecision" class="decision-card hidden"></div>
+          </section>
+        </div>
+      </section>
+
+      <section id="risk" class="view">
+        <div class="page-title"><div><div class="eyebrow">RISK ENGINE</div><h2>Revenue at risk</h2><p>Every event scored before the agent can act.</p></div></div>
+        <div id="riskGrid" class="cards-grid"></div>
+      </section>
+
+      <section id="recovery" class="view">
+        <div class="page-title"><div><div class="eyebrow">ACTION ENGINE</div><h2>Recovery actions</h2><p>Bounded workflows with visible stopping rules.</p></div></div>
+        <div id="recoveryGrid" class="cards-grid"></div>
+      </section>
+
+      <section id="audit" class="view">
+        <div class="page-title"><div><div class="eyebrow">CONTROL</div><h2>Audit trail</h2><p>What Revive decided, why it decided it, and what happened.</p></div></div>
+        <div id="auditTable" class="panel audit-panel"></div>
+      </section>
+    </main>
+  </div>
+
+  <div id="modal" class="modal hidden">
+    <div class="modal-card">
+      <div class="modal-head"><div><div class="eyebrow">LIVE SIMULATOR</div><h2>Create a revenue leak</h2></div><button id="closeModal" class="icon-btn">×</button></div>
+      <div class="form-grid">
+        <label>Event type<select id="eventType"><option value="payment_failed">Failed payment</option><option value="checkout_abandoned">Abandoned checkout</option><option value="invoice_overdue">Overdue invoice</option></select></label>
+        <label>Customer<input id="customer" value="Demo Customer" /></label>
+        <label>Amount (₹)<input id="amount" type="number" value="18500" /></label>
+        <label>Failure reason<select id="failureReason"><option value="insufficient_funds">Insufficient funds</option><option value="expired_card">Expired card</option><option value="temporary_decline">Temporary decline</option></select></label>
+        <label>Previous success rate<input id="successRate" type="number" min="0" max="1" step="0.01" value="0.86" /></label>
+        <label>Prior contacts<input id="priorContacts" type="number" min="0" max="10" value="0" /></label>
+      </div>
+      <button id="createEventBtn" class="primary-btn wide">Run AI recovery decision</button>
+    </div>
+  </div>
+
+  <script src="app.js"></script>
+</body>
+</html>
