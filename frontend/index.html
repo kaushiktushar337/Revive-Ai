@@ -17,6 +17,7 @@
         <button class="nav-item" data-view="recovery">Recovery Actions</button>
         <button class="nav-item" data-view="sources">Data Sources</button>
         <button class="nav-item" data-view="audit">Audit Trail</button>
+        <button class="nav-item" data-view="settings">Merchant Settings</button>
       </nav>
       <div class="sidebar-bottom">
         <div class="connection"><span id="healthDot" class="dot"></span><span id="healthText">Checking API…</span></div>
@@ -31,9 +32,7 @@
           <h1>Find revenue that's slipping away.</h1>
           <p>Detect. Diagnose. Decide. Recover.</p>
         </div>
-        <div class="top-actions">
-          <button id="simulateBtn" class="primary-btn">＋ Simulate revenue leak</button>
-        </div>
+        <div class="top-actions profile-chip"><div class="avatar" id="merchantAvatar">R</div><div><strong id="merchantBusiness">Revive</strong><div class="cell-sub" id="merchantSender">sender not set</div></div><button id="logoutBtn" class="ghost-btn">Log out</button><button id="simulateBtn" class="primary-btn">＋ Simulate revenue leak</button></div>
       </header>
 
       <section id="overview" class="view active-view">
@@ -76,6 +75,10 @@
             <h3>Razorpay webhook</h3>
             <p>POST payment events directly to <code>/api/webhooks/razorpay</code>. Configure a webhook secret for signature verification.</p>
             <span id="razorpayStatus" class="status-pill">Checking…</span>
+            <div class="button-row" style="margin-top:14px">
+              <button id="testRazorpayBtn" class="action-btn">Test Razorpay connection</button>
+            </div>
+            <div id="razorpayTestResult" class="source-result"></div>
           </div>
           <div class="small-card">
             <div class="source-icon">CSV</div>
@@ -98,7 +101,66 @@
         <div class="page-title"><div><div class="eyebrow">CONTROL</div><h2>Audit trail</h2><p>What Revive decided, why it decided it, and what happened.</p></div></div>
         <div id="auditTable" class="panel audit-panel"></div>
       </section>
-    </main>
+    
+      <section id="settings" class="view">
+        <div class="page-title"><div><div class="eyebrow">MERCHANT ACCOUNT</div><h2>Email & account settings</h2><p>Choose the mailbox Revive uses to send recovery emails.</p></div></div>
+        <div class="panel" style="padding:24px;max-width:900px">
+          <div class="form-grid">
+            <label>Business name<input id="settingsBusiness" disabled /></label>
+            <label>Login email<input id="settingsLoginEmail" disabled /></label>
+            <label>Recovery sender email<input id="settingsSenderEmail" type="email" /></label>
+            <label>Email mode<select id="settingsEmailMode"><option value="demo">Demo / preview mode</option><option value="smtp">Real SMTP delivery</option></select></label>
+          </div>
+          <div class="advanced" id="settingsSmtpFields">
+            <div class="form-grid">
+              <label>SMTP host<input id="settingsSmtpHost" placeholder="smtp.gmail.com" /></label>
+              <label>SMTP port<input id="settingsSmtpPort" type="number" value="587" /></label>
+              <label>SMTP username<input id="settingsSmtpUser" placeholder="sender@example.com" /></label>
+              <label>SMTP password / app password<input id="settingsSmtpPassword" type="password" /></label>
+            </div>
+            <p class="auth-help">For real delivery, the sender mailbox must allow authenticated SMTP. For Gmail, use an app password rather than your normal account password.</p>
+          </div>
+          <div class="button-row" style="margin-top:18px"><button id="saveEmailSettingsBtn" class="primary-btn">Save email settings</button></div>
+          <div class="test-email-box">
+            <div class="test-email-copy"><strong>Test your sender</strong><span>Send a real test message from the configured mailbox.</span></div>
+            <div class="test-email-actions"><input id="testEmailRecipient" type="email" placeholder="your-email@example.com" /><button id="testEmailBtn" class="action-btn">Send test email</button></div>
+          </div>
+          <div id="settingsResult" class="source-result"></div>
+        </div>
+      </section>
+</main>
+  </div>
+
+  
+  <div id="authOverlay" class="auth-overlay">
+    <div class="auth-card">
+      <div class="auth-brand">REVIVE</div><div class="auth-sub">AI revenue recovery agent</div>
+      <div class="auth-tabs"><button id="loginTab" class="auth-tab active">Log in</button><button id="signupTab" class="auth-tab">Create merchant ID</button></div>
+      <div id="authError" class="auth-error"></div>
+      <form id="loginForm" class="auth-form">
+        <label>Login email<input id="loginEmail" type="email" value="demo@revive.local" required /></label>
+        <label>Password<input id="loginPassword" type="password" value="demo12345" required /></label>
+        <button class="primary-btn wide" type="submit">Log in</button>
+        <div class="auth-help">Demo account: demo@revive.local / demo12345</div>
+      </form>
+      <form id="signupForm" class="auth-form hidden">
+        <label>Business name<input id="signupBusiness" required placeholder="Acme Store" /></label>
+        <label>Login email<input id="signupEmail" type="email" required placeholder="you@company.com" /></label>
+        <label>Password<input id="signupPassword" type="password" required minlength="8" placeholder="At least 8 characters" /></label>
+        <label>Recovery sender email<input id="signupSender" type="email" required placeholder="recover@company.com" /></label>
+        <label class="auth-check"><input id="signupDemoMode" type="checkbox" checked /> <span>Use demo email mode for now</span></label>
+        <div id="signupSmtp" class="advanced hidden">
+          <div class="form-grid">
+            <label>SMTP host<input id="signupSmtpHost" placeholder="smtp.gmail.com" /></label>
+            <label>SMTP port<input id="signupSmtpPort" type="number" value="587" /></label>
+            <label>SMTP username<input id="signupSmtpUser" /></label>
+            <label>SMTP password / app password<input id="signupSmtpPassword" type="password" /></label>
+          </div>
+          <p class="auth-help">The sender email is the address customers will see. Real SMTP delivery additionally needs authenticated SMTP credentials.</p>
+        </div>
+        <button class="primary-btn wide" type="submit">Create merchant ID</button>
+      </form>
+    </div>
   </div>
 
   <div id="modal" class="modal hidden">
@@ -107,6 +169,7 @@
       <div class="form-grid">
         <label>Event type<select id="eventType"><option value="payment_failed">Failed payment</option><option value="checkout_abandoned">Abandoned checkout</option><option value="invoice_overdue">Overdue invoice</option></select></label>
         <label>Customer<input id="customer" value="Demo Customer" /></label>
+        <label>Customer email<input id="customerEmail" type="email" value="demo@example.com" /></label>
         <label>Amount (₹)<input id="amount" type="number" min="1" value="18500" /></label>
         <label>Failure reason<select id="failureReason"><option value="insufficient_funds">Insufficient funds</option><option value="expired_card">Expired card</option><option value="temporary_decline">Temporary decline</option></select></label>
         <label>Previous success rate<input id="successRate" type="number" min="0" max="1" step="0.01" value="0.86" /></label>
