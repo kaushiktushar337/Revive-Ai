@@ -328,6 +328,8 @@ def event_payload_to_internal(payload: dict[str, Any], source: str = "razorpay")
             "payment_link_status": payment_link.get("status"),
             "recovery_expires_at": payment_link.get("expire_by"),
         }
+    if event_name in {"payment.captured", "order.paid", "payment.authorized"}:
+        return {**common, "event_type": "payment_captured"}
     return None
 
 
