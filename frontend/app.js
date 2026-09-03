@@ -201,3 +201,20 @@ document.addEventListener('click', e=>{ if(!e.target.closest('.account-menu-wrap
 $('#accountSettingsBtn')?.addEventListener('click',()=>{ $('#accountMenu')?.classList.add('hidden'); showView('settings'); });
 $('#refreshAuditBtn')?.addEventListener('click', loadAudit);
 (async()=>{if(await authenticate())await refresh()})();
+
+
+$('#saveActiveGatewayBtn').addEventListener('click',async()=>{
+  try{
+    const gateway=String($('#activeGateway').value).trim().toLowerCase();
+    const out=await request('/integrations/payment-gateway',{
+      method:'PUT',
+      headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({gateway})
+    });
+    $('#activeGatewayStatus').textContent=gateway==='razorpay'?'Razorpay':'PayU';
+    $('#activeGatewayResult').textContent=`${gateway==='razorpay'?'Razorpay':'PayU'} is now the active payment gateway.`;
+    applyMerchant(await request('/auth/me'));
+  }catch(e){
+    $('#activeGatewayResult').textContent=e.message;
+  }
+});

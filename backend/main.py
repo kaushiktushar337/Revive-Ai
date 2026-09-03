@@ -78,7 +78,7 @@ class MerchantEmailSettingsIn(BaseModel):
     smtp_password: str | None = None
 
 
-def merchant_from_token(authorization: str | None) -> sqlite3.Row:
+def merchant_from_token(authorization: str | None = Header(default=None)) -> sqlite3.Row:
     if not authorization or not authorization.lower().startswith('bearer '):
         raise HTTPException(status_code=401, detail='Authentication required')
     payload = verify_token(authorization.split(' ', 1)[1].strip())
