@@ -22,17 +22,19 @@ def verify_webhook_signature(raw_body: bytes, signature: str, secret: str) -> bo
     return hmac.compare_digest(digest, signature)
 
 
-def _auth_header() -> str:
-    token = f"{RAZORPAY_KEY_ID}:{RAZORPAY_KEY_SECRET}".encode("utf-8")
+def _auth_header(key_id: str | None = None, key_secret: str | None = None) -> str:
+    key_id = key_id if key_id is not None else RAZORPAY_KEY_ID
+    key_secret = key_secret if key_secret is not None else RAZORPAY_KEY_SECRET
+    token = f"{key_id}:{key_secret}".encode("utf-8")
     return "Basic " + base64.b64encode(token).decode("ascii")
 
 
-def _request(method: str, path: str, **kwargs: Any) -> requests.Response:
+def _request(method: str, path: str, key_id: str | None = None, key_secret: str | None = None, **kwargs: Any) -> requests.Response:
     return requests.request(
         method,
         f"{RAZORPAY_BASE_URL.rstrip('/')}/{path.lstrip('/')}",
         headers={
-            "Authorization": _auth_header(),
+            "Authorization": _auth_header(key_id, key_secret),
             "Content-Type": "application/json",
             **kwargs.pop("headers", {}),
         },
@@ -41,23 +43,27 @@ def _request(method: str, path: str, **kwargs: Any) -> requests.Response:
     )
 
 
-def test_connection() -> dict[str, Any]:
+def test_connection(key_id: str | None = None, key_secret: str | None = None, mode: str = "test") -> dict[str, Any]:
     """Verify Razorpay test credentials using a read-only API call."""
-    if not RAZORPAY_KEY_ID or not RAZORPAY_KEY_SECRET:
-        return {"configured": False, "ok": False, "mode": "demo", "message": "Razorpay credentials are not configured."}
-    response = _request("GET", "/payments", params={"count": 1})
+    key_id = key_id if key_id is not None else RAZORPAY_KEY_ID
+    key_secret = key_secret if key_secret is not None else RAZORPAY_KEY_SECRET
+    if not key_id or not key_secret:
+        return {"configured": False, "ok": False, "mode": mode, "message": "Razorpay credentials are not configured."}
+    response = _request("GET", "/payments", key_id=key_id, key_secret=key_secret, params={"count": 1})
     if response.ok:
-        return {"configured": True, "ok": True, "mode": "live-test-api", "status_code": response.status_code}
+        return {"configured": True, "ok": True, "mode": mode, "status_code": response.status_code}
     try:
         detail = response.json()
     except ValueError:
         detail = {"error": response.text[:300]}
-    return {"configured": True, "ok": False, "mode": "live-test-api", "status_code": response.status_code, "detail": detail}
+    return {"configured": True, "ok": False, "mode": mode, "status_code": response.status_code, "detail": detail}
 
 
-def create_payment_link(amount_inr: float, customer: str, description: str, reference_id: str) -> dict[str, Any]:
+def create_payment_link(amount_inr: float, customer: str, description: str, reference_id: str, key_id: str | None = None, key_secret: str | None = None) -> dict[str, Any]:
     """Create a Razorpay payment link, or return a deterministic demo link in mock mode."""
-    if MOCK_EXTERNAL_ACTIONS or not RAZORPAY_KEY_ID or not RAZORPAY_KEY_SECRET:
+    key_id = key_id if key_id is not None else RAZORPAY_KEY_ID
+    key_secret = key_secret if key_secret is not None else RAZORPAY_KEY_SECRET
+    if MOCK_EXTERNAL_ACTIONS or not key_id or not key_secret:
         return {
             "mode": "demo",
             "id": f"plink_demo_{reference_id}",
@@ -76,6 +82,16 @@ def create_payment_link(amount_inr: float, customer: str, description: str, refe
         "reminder_enable": True,
         "notes": {"revive_event_id": reference_id[:40]},
     }
-    response = _request("POST", "/payment_links", json=payload)
+    response = _request("POST", "/payment_links", key_id=key_id, key_secret=key_secret, json=payload)
+    response.raise_for_status()
+    return response.json()
+
+
+def fetch_payment_link(link_id: str, key_id: str | None = None, key_secret: str | None = None) -> dict[str, Any]:
+    key_id = key_id if key_id is not None else RAZORPAY_KEY_ID
+    key_secret = key_secret if key_secret is not None else RAZORPAY_KEY_SECRET
+    if not key_id or not key_secret:
+        raise ValueError("Razorpay credentials are not configured")
+    response = _request("GET", f"/payment_links/{link_id}", key_id=key_id, key_secret=key_secret)
     response.raise_for_status()
     return response.json()

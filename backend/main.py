@@ -14,10 +14,10 @@ from fastapi import Depends, FastAPI, File, Header, HTTPException, Request, Uplo
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
-from config import APP_ENV, CORS_ORIGINS, RAZORPAY_KEY_ID, RAZORPAY_WEBHOOK_SECRET
+from config import APP_ENV, CORS_ORIGINS, PUBLIC_BASE_URL, RAZORPAY_KEY_ID, RAZORPAY_WEBHOOK_SECRET
 from engine import bounded_decision
 from model import predict_probability
-from razorpay_adapter import create_payment_link, test_connection, verify_webhook_signature
+from razorpay_adapter import create_payment_link, fetch_payment_link, test_connection, verify_webhook_signature
 from email_adapter import send_email
 from auth import hash_password, issue_token, verify_password, verify_token
 
@@ -49,6 +49,12 @@ class MerchantSignupIn(BaseModel):
 class MerchantLoginIn(BaseModel):
     login_email: str
     password: str
+
+class MerchantRazorpaySettingsIn(BaseModel):
+    key_id: str = Field(min_length=10, max_length=100)
+    key_secret: str = Field(min_length=10, max_length=200)
+    webhook_secret: str = Field(min_length=8, max_length=200)
+    mode: str = Field(default="test", pattern="^(test|live)$")
 
 class MerchantEmailSettingsIn(BaseModel):
     sender_email: str = Field(min_length=5, max_length=200)
@@ -126,6 +132,10 @@ def init_db():
             smtp_port INTEGER DEFAULT 587,
             smtp_username TEXT,
             smtp_password TEXT,
+            razorpay_key_id TEXT,
+            razorpay_key_secret TEXT,
+            razorpay_webhook_secret TEXT,
+            razorpay_mode TEXT DEFAULT 'test',
             active INTEGER NOT NULL DEFAULT 1,
             created_at TEXT NOT NULL
         )""")
@@ -170,6 +180,10 @@ def init_db():
     conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_events_external_id ON events(external_id) WHERE external_id IS NOT NULL")
     ensure_column(conn, "events", "customer_email", "TEXT")
     ensure_column(conn, "events", "consent_to_email", "INTEGER DEFAULT 0")
+    ensure_column(conn, "merchants", "razorpay_key_id", "TEXT")
+    ensure_column(conn, "merchants", "razorpay_key_secret", "TEXT")
+    ensure_column(conn, "merchants", "razorpay_webhook_secret", "TEXT")
+    ensure_column(conn, "merchants", "razorpay_mode", "TEXT DEFAULT 'test'" )
     ensure_column(conn, "events", "contact_count", "INTEGER DEFAULT 0")
     ensure_column(conn, "events", "last_contact_at", "TEXT")
     conn.execute(
@@ -328,8 +342,6 @@ def event_payload_to_internal(payload: dict[str, Any], source: str = "razorpay")
             "payment_link_status": payment_link.get("status"),
             "recovery_expires_at": payment_link.get("expire_by"),
         }
-    if event_name in {"payment.captured", "order.paid", "payment.authorized"}:
-        return {**common, "event_type": "payment_captured"}
     return None
 
 
@@ -381,6 +393,11 @@ def me(merchant: sqlite3.Row = Depends(lambda authorization=Header(default=None)
         "smtp_port": merchant["smtp_port"],
         "smtp_username": merchant["smtp_username"],
         "smtp_configured": bool(merchant["smtp_host"] and merchant["smtp_username"] and merchant["smtp_password"]),
+        "razorpay_configured": bool(merchant["razorpay_key_id"] and merchant["razorpay_key_secret"]),
+        "razorpay_webhook_configured": bool(merchant["razorpay_webhook_secret"]),
+        "razorpay_mode": merchant["razorpay_mode"] or "test",
+        "razorpay_key_id": merchant["razorpay_key_id"] or "",
+        "razorpay_webhook_url": f"{PUBLIC_BASE_URL.rstrip('/')}/api/webhooks/razorpay/{merchant['id']}",
     }
 
 @app.put("/api/auth/email-settings")
@@ -401,6 +418,32 @@ def update_email_settings(payload: MerchantEmailSettingsIn, merchant: sqlite3.Ro
 class EmailTestIn(BaseModel):
     recipient: str = Field(min_length=5, max_length=200)
 
+
+@app.get("/api/integrations/razorpay/settings")
+def get_razorpay_settings(merchant: sqlite3.Row = Depends(lambda authorization=Header(default=None): merchant_from_token(authorization))):
+    return {
+        "configured": bool(merchant["razorpay_key_id"] and merchant["razorpay_key_secret"]),
+        "webhook_configured": bool(merchant["razorpay_webhook_secret"]),
+        "mode": merchant["razorpay_mode"] or "test",
+        "key_id": merchant["razorpay_key_id"] or "",
+        "webhook_url": f"{PUBLIC_BASE_URL.rstrip('/')}/api/webhooks/razorpay/{merchant['id']}",
+    }
+
+@app.put("/api/integrations/razorpay/settings")
+def update_razorpay_settings(payload: MerchantRazorpaySettingsIn, merchant: sqlite3.Row = Depends(lambda authorization=Header(default=None): merchant_from_token(authorization))):
+    if payload.mode == "test" and not payload.key_id.startswith("rzp_test_"):
+        raise HTTPException(status_code=400, detail="Test mode requires a Razorpay test key ID starting with rzp_test_.")
+    if payload.mode == "live" and not payload.key_id.startswith("rzp_live_"):
+        raise HTTPException(status_code=400, detail="Live mode requires a Razorpay live key ID starting with rzp_live_.")
+    conn = db()
+    conn.execute("UPDATE merchants SET razorpay_key_id=?, razorpay_key_secret=?, razorpay_webhook_secret=?, razorpay_mode=? WHERE id=?", (payload.key_id.strip(), payload.key_secret, payload.webhook_secret, payload.mode, merchant["id"]))
+    conn.commit(); conn.close()
+    audit(None, "razorpay_settings", "saved", f"Razorpay {payload.mode} credentials configured.", merchant["id"])
+    return {"ok": True, "configured": True, "mode": payload.mode, "key_id": payload.key_id.strip(), "webhook_url": f"{PUBLIC_BASE_URL.rstrip('/')}/api/webhooks/razorpay/{merchant['id']}"}
+
+@app.get("/api/integrations/razorpay/test-merchant")
+def razorpay_test_connection_for_merchant(merchant: sqlite3.Row = Depends(lambda authorization=Header(default=None): merchant_from_token(authorization))):
+    return test_connection(merchant["razorpay_key_id"], merchant["razorpay_key_secret"], merchant["razorpay_mode"] or "test")
 
 @app.post("/api/auth/email-test")
 def test_email_delivery(payload: EmailTestIn, merchant: sqlite3.Row = Depends(lambda authorization=Header(default=None): merchant_from_token(authorization))):
@@ -531,7 +574,7 @@ def execute_event(event_id: str, merchant: sqlite3.Row = Depends(lambda authoriz
         lifecycle = "ESCALATION_REQUIRED"
         message = "Agent escalated the case because the bounded policy requires human approval."
     elif action == "send_payment_link":
-        result = create_payment_link(row["amount"], row["customer"], f"Revive recovery for {row['customer']}", event_id)
+        result = create_payment_link(row["amount"], row["customer"], f"Revive recovery for {row['customer']}", event_id, key_id=merchant["razorpay_key_id"], key_secret=merchant["razorpay_key_secret"])
         reference = result.get("short_url") or result.get("id")
         link_id = result.get("id")
         link_url = result.get("short_url")
@@ -556,6 +599,26 @@ def execute_event(event_id: str, merchant: sqlite3.Row = Depends(lambda authoriz
     return {"id": event_id, "action": action, "status": status, "lifecycle_status": lifecycle, "recovered": False, "amount": row["amount"], "reference": reference, "action_payload": action_payload, "message": message}
 
 
+@app.post("/api/events/{event_id}/sync-payment-link")
+def sync_payment_link(event_id: str, merchant: sqlite3.Row = Depends(lambda authorization=Header(default=None): merchant_from_token(authorization))):
+    conn = db(); row = conn.execute("SELECT * FROM events WHERE id=? AND merchant_id=?", (event_id, merchant["id"])).fetchone(); conn.close()
+    if not row: raise HTTPException(status_code=404, detail="Event not found")
+    if not row["recovery_link_id"]: raise HTTPException(status_code=400, detail="This event has no Razorpay payment link")
+    if not merchant["razorpay_key_id"] or not merchant["razorpay_key_secret"]:
+        raise HTTPException(status_code=400, detail="Connect Razorpay before syncing a payment link")
+    try:
+        remote = fetch_payment_link(row["recovery_link_id"], merchant["razorpay_key_id"], merchant["razorpay_key_secret"])
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"Razorpay payment link sync failed: {exc}") from exc
+    status = remote.get("status") or "unknown"
+    paid_amount = float(remote.get("amount_paid") or 0) / 100
+    paid = status == "paid" or paid_amount >= float(row["amount"])
+    conn=db()
+    if paid:
+        now=datetime.now(timezone.utc).isoformat(); conn.execute("UPDATE events SET action_status='recovered', lifecycle_status='RECOVERED', recovered=1, recovered_at=?, recovered_amount=?, outcome_source='payment_link_sync' WHERE id=?",(now,paid_amount or row["amount"],event_id)); conn.commit(); conn.close(); audit(event_id,"payment_link_synced","recovered",f"Razorpay API reports the payment link is paid.",merchant["id"]); return {"ok":True,"status":status,"recovered":True,"recovered_amount":paid_amount or row["amount"]}
+    conn.execute("UPDATE events SET action_payload=? WHERE id=?", (json.dumps({"payment_link_sync": remote}), event_id)); conn.commit(); conn.close(); audit(event_id,"payment_link_synced","checked",f"Razorpay API reports payment link status: {status}.",merchant["id"]); return {"ok":True,"status":status,"recovered":False,"recovered_amount":paid_amount}
+
+
 @app.post("/api/events/{event_id}/confirm-recovered")
 def confirm_recovered(event_id: str, merchant: sqlite3.Row = Depends(lambda authorization=Header(default=None): merchant_from_token(authorization))):
     conn = db()
@@ -571,47 +634,32 @@ def confirm_recovered(event_id: str, merchant: sqlite3.Row = Depends(lambda auth
     return {"id": event_id, "status": "recovered", "recovered": True, "amount": row["amount"]}
 
 
-@app.post("/api/webhooks/razorpay")
-async def razorpay_webhook(request: Request, x_razorpay_signature: str | None = Header(default=None), x_revive_merchant_id: str | None = Header(default=None)):
-    raw = await request.body()
-    if RAZORPAY_WEBHOOK_SECRET and not verify_webhook_signature(raw, x_razorpay_signature or "", RAZORPAY_WEBHOOK_SECRET):
-        raise HTTPException(status_code=401, detail="Invalid Razorpay webhook signature")
-    try:
-        payload = json.loads(raw.decode("utf-8"))
-    except json.JSONDecodeError as exc:
-        raise HTTPException(status_code=400, detail="Invalid JSON") from exc
-
+def process_razorpay_payload(payload: dict[str, Any], merchant_id: str):
     event_name = payload.get("event", "unknown")
     webhook_external_id = payload.get("id") or f"wh_{uuid.uuid4().hex[:10]}"
     internal = event_payload_to_internal(payload)
-    webhook_merchant_id = x_revive_merchant_id or "m_demo"
-
     conn = db()
     existing = conn.execute("SELECT id FROM webhook_events WHERE source=? AND external_id=?", ("razorpay", webhook_external_id)).fetchone()
-    if not existing:
-        conn.execute("INSERT OR IGNORE INTO webhook_events(id,source,event_name,external_id,received_at,payload) VALUES(?,?,?,?,?,?)", (webhook_external_id, "razorpay", event_name, webhook_external_id, datetime.now(timezone.utc).isoformat(), json.dumps(payload)))
-        conn.commit()
-    conn.close()
     if existing:
+        conn.close()
         return {"ok": True, "deduplicated": True, "event": event_name}
+    conn.execute("INSERT OR IGNORE INTO webhook_events(id,source,event_name,external_id,received_at,payload) VALUES(?,?,?,?,?,?)", (webhook_external_id, "razorpay", event_name, webhook_external_id, datetime.now(timezone.utc).isoformat(), json.dumps(payload)))
+    conn.commit(); conn.close()
 
     if not internal or internal.get("amount", 0) <= 0:
-        audit(None, "webhook", "ignored", f"Unsupported Razorpay event {event_name}.")
+        audit(None, "webhook", "ignored", f"Unsupported Razorpay event {event_name}.", merchant_id)
         return {"ok": True, "ignored": True, "reason": "Unsupported event", "event": event_name}
 
-    # Recovery payment-link lifecycle events. These are the strongest signal for links created by Revive.
     if event_name.startswith("payment_link."):
         link_id = internal.get("payment_link_id")
         reference_id = internal.get("payment_link_reference_id")
-        conn = db()
-        row = None
+        conn = db(); row = None
         if reference_id:
-            row = conn.execute("SELECT id FROM events WHERE merchant_id=? AND (id=? OR recovery_link_id=? OR action_reference=?) ORDER BY created_at DESC LIMIT 1", (webhook_merchant_id, reference_id, link_id, internal.get("payment_link_url"))).fetchone()
+            row = conn.execute("SELECT id FROM events WHERE merchant_id=? AND (id=? OR recovery_link_id=? OR action_reference=?) ORDER BY created_at DESC LIMIT 1", (merchant_id, reference_id, link_id, internal.get("payment_link_url"))).fetchone()
         if not row and link_id:
-            row = conn.execute("SELECT id FROM events WHERE recovery_link_id=? AND merchant_id=? ORDER BY created_at DESC LIMIT 1", (link_id, webhook_merchant_id)).fetchone()
+            row = conn.execute("SELECT id FROM events WHERE recovery_link_id=? AND merchant_id=? ORDER BY created_at DESC LIMIT 1", (link_id, merchant_id)).fetchone()
         if not row and internal.get("payment_id"):
-            row = conn.execute("SELECT id FROM events WHERE external_id=? AND merchant_id=? ORDER BY created_at DESC LIMIT 1", (internal.get("payment_id"), webhook_merchant_id)).fetchone()
-
+            row = conn.execute("SELECT id FROM events WHERE external_id=? AND merchant_id=? ORDER BY created_at DESC LIMIT 1", (internal.get("payment_id"), merchant_id)).fetchone()
         if row:
             event_id = row["id"]
             status_map = {
@@ -624,37 +672,71 @@ async def razorpay_webhook(request: Request, x_razorpay_signature: str | None = 
             recovered_at = datetime.now(timezone.utc).isoformat() if recovered else None
             recovered_amount = internal.get("recovery_paid_amount") if recovered else 0
             conn.execute("UPDATE events SET action_status=?, lifecycle_status=?, recovered=?, recovered_at=?, recovered_amount=?, outcome_source=?, recovery_link_id=COALESCE(?, recovery_link_id), recovery_link_url=COALESCE(?, recovery_link_url) WHERE id=?", (action_status, lifecycle, recovered, recovered_at, recovered_amount, source, link_id, internal.get("payment_link_url"), event_id))
-            conn.commit()
-            conn.close()
-            audit(event_id, "payment_link_reconciled", lifecycle.lower(), f"Razorpay {event_name} updated recovery outcome.")
+            conn.commit(); conn.close()
+            audit(event_id, "payment_link_reconciled", lifecycle.lower(), f"Razorpay {event_name} updated recovery outcome.", merchant_id)
             return {"ok": True, "reconciled": True, "event_id": event_id, "event": event_name, "lifecycle_status": lifecycle, "recovered_amount": recovered_amount}
         conn.close()
         return {"ok": True, "reconciled": False, "event": event_name, "reason": "No matching Revive payment link"}
 
     if internal["event_type"] == "payment_captured":
-        conn = db()
-        row = conn.execute("SELECT id FROM events WHERE external_id=? AND merchant_id=? ORDER BY created_at DESC LIMIT 1", (internal.get("external_id"), webhook_merchant_id)).fetchone()
+        conn = db(); row = conn.execute("SELECT id FROM events WHERE external_id=? AND merchant_id=? ORDER BY created_at DESC LIMIT 1", (internal.get("external_id"), merchant_id)).fetchone()
         if row:
             now = datetime.now(timezone.utc).isoformat()
             conn.execute("UPDATE events SET action_status='recovered', lifecycle_status='RECOVERED', recovered=1, recovered_at=?, recovered_amount=amount, outcome_source='payment_webhook' WHERE id=?", (now, row["id"]))
-            conn.commit()
-            conn.close()
-            audit(row["id"], "payment_reconciled", "recovered", f"Razorpay {event_name} reconciled the payment.")
+            conn.commit(); conn.close()
+            audit(row["id"], "payment_reconciled", "recovered", f"Razorpay {event_name} reconciled the payment.", merchant_id)
             return {"ok": True, "reconciled": True, "event_id": row["id"], "event": event_name}
         conn.close()
         return {"ok": True, "reconciled": False, "event": event_name, "reason": "No matching risk event"}
 
     if internal["event_type"] == "payment_failed" and internal.get("external_id"):
-        conn = db()
-        existing_event = conn.execute("SELECT id FROM events WHERE external_id=?", (internal["external_id"],)).fetchone()
-        conn.close()
+        conn = db(); existing_event = conn.execute("SELECT id FROM events WHERE external_id=? AND merchant_id=?", (internal["external_id"], merchant_id)).fetchone(); conn.close()
         if existing_event:
             return {"ok": True, "deduplicated": True, "event": event_name, "event_id": existing_event["id"]}
 
     decision = hydrate(internal)
-    event_id = insert_event(internal, decision, webhook_merchant_id)
-    audit(event_id, "webhook", "ingested", f"Razorpay event {event_name} ingested.")
+    event_id = insert_event(internal, decision, merchant_id)
+    audit(event_id, "webhook", "ingested", f"Razorpay event {event_name} ingested.", merchant_id)
     return {"ok": True, "event_id": event_id, "recommended_action": decision.recommended_action, "recovery_probability": decision.recovery_probability, "lifecycle_status": "RECOMMENDED"}
+
+
+@app.post("/api/webhooks/razorpay")
+async def razorpay_webhook(request: Request, x_razorpay_signature: str | None = Header(default=None), x_revive_merchant_id: str | None = Header(default=None)):
+    raw = await request.body()
+    merchant_id = x_revive_merchant_id or "m_demo"
+    webhook_secret = RAZORPAY_WEBHOOK_SECRET
+    if merchant_id != "m_demo":
+        conn = db(); mrow = conn.execute("SELECT * FROM merchants WHERE id=? AND active=1", (merchant_id,)).fetchone(); conn.close()
+        if not mrow:
+            raise HTTPException(status_code=404, detail="Merchant not found")
+        webhook_secret = mrow["razorpay_webhook_secret"] or ""
+    if not webhook_secret:
+        raise HTTPException(status_code=400, detail="Razorpay webhook secret is not configured for this merchant")
+    if not verify_webhook_signature(raw, x_razorpay_signature or "", webhook_secret):
+        raise HTTPException(status_code=401, detail="Invalid Razorpay webhook signature")
+    try:
+        payload = json.loads(raw.decode("utf-8"))
+    except json.JSONDecodeError as exc:
+        raise HTTPException(status_code=400, detail="Invalid JSON") from exc
+    return process_razorpay_payload(payload, merchant_id)
+
+
+@app.post("/api/webhooks/razorpay/{merchant_id}")
+async def razorpay_merchant_webhook(merchant_id: str, request: Request, x_razorpay_signature: str | None = Header(default=None)):
+    conn = db(); mrow = conn.execute("SELECT * FROM merchants WHERE id=? AND active=1", (merchant_id,)).fetchone(); conn.close()
+    if not mrow:
+        raise HTTPException(status_code=404, detail="Merchant not found")
+    raw = await request.body()
+    secret = mrow["razorpay_webhook_secret"] or ""
+    if not secret:
+        raise HTTPException(status_code=400, detail="Razorpay webhook secret is not configured")
+    if not verify_webhook_signature(raw, x_razorpay_signature or "", secret):
+        raise HTTPException(status_code=401, detail="Invalid Razorpay webhook signature")
+    try:
+        payload = json.loads(raw.decode("utf-8"))
+    except json.JSONDecodeError as exc:
+        raise HTTPException(status_code=400, detail="Invalid JSON") from exc
+    return process_razorpay_payload(payload, merchant_id)
 
 
 @app.post("/api/checkout/events")

@@ -56,7 +56,7 @@ function renderRecovery(events) {
       <div class="big-number">${currency(e.amount)}</div>
       <p><strong>${esc(e.customer)}</strong></p>
       <p>${esc(e.action_reason)}</p>
-      ${e.recovery_link_url ? `<div class="reason-box"><strong>Recovery link</strong><br><a href="${esc(e.recovery_link_url)}" target="_blank" rel="noopener">Open payment link</a></div>` : ''}
+      ${e.recovery_link_url ? `<div class="reason-box"><strong>Recovery link</strong><br><a href="${esc(e.recovery_link_url)}" target="_blank" rel="noopener">Open payment link</a>${e.recovered ? '' : `<br><button class="action-btn" style="margin-top:8px" onclick="syncPaymentLink('${esc(e.id)}')">Sync payment status</button>`}</div>` : ''}
       ${e.recovered_amount ? `<div class="reason-box"><strong>Recovered</strong><br>${currency(e.recovered_amount)} · ${esc(e.outcome_source || 'confirmed')}</div>` : ''}
       <div class="button-row">
         <button class="action-btn" onclick="executeEvent('${esc(e.id)}')">Execute</button>
@@ -107,6 +107,15 @@ async function sendRecoveryEmail(id, recipient) {
   } catch (err) { showError(err.message); }
 }
 window.sendRecoveryEmail = sendRecoveryEmail;
+
+async function syncPaymentLink(id) {
+  try {
+    const out = await request(`/events/${encodeURIComponent(id)}/sync-payment-link`, { method:'POST' });
+    showDecision({ action:'payment_link_sync', status:out.status, lifecycle_status:out.recovered ? 'RECOVERED' : 'AWAITING_OUTCOME', recovered:out.recovered, amount:out.recovered_amount || 0, message: out.recovered ? 'Razorpay confirms the payment link was paid.' : `Razorpay payment link status: ${out.status}` });
+    await refresh();
+  } catch (err) { showError(err.message); }
+}
+window.syncPaymentLink = syncPaymentLink;
 
 function showDecision(out) {
   document.querySelector('#agentEmpty').classList.add('hidden');
@@ -209,7 +218,7 @@ document.querySelector('#testRazorpayBtn').addEventListener('click', async () =>
   const result = document.querySelector('#razorpayTestResult');
   result.textContent = 'Testing read-only Razorpay API connection…';
   try {
-    const out = await request('/integrations/razorpay/test');
+    const out = await request('/integrations/razorpay/test-merchant');
     result.textContent = out.ok ? 'Razorpay connection verified.' : (out.message || `Connection failed (${out.status_code || 'unknown'})`);
   } catch (err) {
     result.textContent = err.message;
@@ -270,6 +279,13 @@ function applyMerchant(m) {
   if (m.smtp_host) document.querySelector('#settingsSmtpHost').value = m.smtp_host;
   if (m.smtp_port) document.querySelector('#settingsSmtpPort').value = m.smtp_port;
   if (m.smtp_username) document.querySelector('#settingsSmtpUser').value = m.smtp_username;
+  if (document.querySelector('#rzpMode')) {
+    document.querySelector('#rzpMode').value = m.razorpay_mode || 'test';
+    document.querySelector('#rzpKeyId').value = m.razorpay_key_id || '';
+    document.querySelector('#rzpWebhookUrl').textContent = m.razorpay_webhook_url || 'Not configured';
+    document.querySelector('#merchantRazorpayStatus').textContent = m.razorpay_configured ? `${(m.razorpay_mode || 'test').toUpperCase()} connected` : 'Not connected';
+    document.querySelector('#merchantRazorpayStatus').className = `status-pill ${m.razorpay_configured ? 'good-status' : ''}`;
+  }
 }
 
 async function authenticateExisting() {
@@ -327,6 +343,35 @@ document.querySelector('#saveEmailSettingsBtn').addEventListener('click', async 
     const me = await request('/auth/me'); applyMerchant(me);
     document.querySelector('#settingsResult').textContent = 'Email settings saved.';
   } catch(err) { document.querySelector('#settingsResult').textContent = err.message; }
+});
+
+document.querySelector('#rzpMode')?.addEventListener('change', e => {
+  const key = document.querySelector('#rzpKeyId');
+  key.placeholder = e.target.value === 'live' ? 'rzp_live_...' : 'rzp_test_...';
+});
+
+document.querySelector('#saveRazorpayBtn')?.addEventListener('click', async () => {
+  const result = document.querySelector('#razorpayMerchantResult');
+  const mode = document.querySelector('#rzpMode').value;
+  const keyId = document.querySelector('#rzpKeyId').value.trim();
+  const secret = document.querySelector('#rzpKeySecret').value;
+  const webhook = document.querySelector('#rzpWebhookSecret').value;
+  if (!keyId || !secret || !webhook) { result.textContent = 'Enter Key ID, Key Secret and Webhook Secret.'; return; }
+  result.textContent = 'Saving Razorpay connection…';
+  try {
+    const out = await request('/integrations/razorpay/settings', { method:'PUT', headers:{'Content-Type':'application/json'}, body:JSON.stringify({key_id:keyId,key_secret:secret,webhook_secret:webhook,mode}) });
+    result.textContent = `Saved ${mode.toUpperCase()} connection. Webhook URL: ${out.webhook_url}`;
+    const me = await request('/auth/me'); applyMerchant(me);
+  } catch (err) { result.textContent = err.message; }
+});
+
+document.querySelector('#testRazorpayMerchantBtn')?.addEventListener('click', async () => {
+  const result = document.querySelector('#razorpayMerchantResult');
+  result.textContent = 'Testing Razorpay API…';
+  try {
+    const out = await request('/integrations/razorpay/test-merchant');
+    result.textContent = out.ok ? `Razorpay ${String(out.mode || 'test').toUpperCase()} API connection verified.` : (out.message || `Connection failed (${out.status_code || 'unknown'})`);
+  } catch (err) { result.textContent = err.message; }
 });
 
 document.querySelector('#logoutBtn').addEventListener('click', () => { setToken(''); showAuth(true); });
