@@ -37,6 +37,7 @@ def test_merchant_razorpay_connection_and_link_and_sync(monkeypatch):
     assert r.status_code==200
     r=client.get('/api/integrations/razorpay/test-merchant',headers=headers)
     assert r.status_code==200 and r.json()['ok'] is True
+    conn=main.db(); conn.execute("UPDATE merchants SET payment_gateway='razorpay' WHERE id=?", (reg.json()['merchant']['id'],)); conn.commit(); conn.close()
     # Force real adapter mode for this test
     monkeypatch.setattr(razorpay_adapter, 'MOCK_EXTERNAL_ACTIONS', False)
     e=client.post('/api/events',headers=headers,json={'event_type':'invoice_overdue','customer':'Alice','amount':18500,'currency':'INR','source':'razorpay_test','failure_reason':None,'days_overdue':7,'previous_success_rate':0.9,'customer_value':50000,'customer_email':'alice@example.com','consent_to_email':True})

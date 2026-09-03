@@ -18,6 +18,7 @@ from config import APP_ENV, CORS_ORIGINS, PUBLIC_BASE_URL, RAZORPAY_KEY_ID, RAZO
 from engine import bounded_decision
 from model import predict_probability
 from razorpay_adapter import create_payment_link, fetch_payment_link, test_connection, verify_webhook_signature
+from payu_adapter import create_payment_link as create_payu_payment_link, fetch_payment_link as fetch_payu_payment_link, test_connection as test_payu_connection, verify_response_hash as verify_payu_response_hash
 from email_adapter import send_email
 from auth import hash_password, issue_token, verify_password, verify_token
 
@@ -49,6 +50,14 @@ class MerchantSignupIn(BaseModel):
 class MerchantLoginIn(BaseModel):
     login_email: str
     password: str
+
+class MerchantPayUSettingsIn(BaseModel):
+    merchant_id: str = Field(min_length=3, max_length=100)
+    client_id: str = Field(min_length=5, max_length=200)
+    client_secret: str = Field(min_length=5, max_length=300)
+    key: str = Field(default="", max_length=100)
+    salt: str = Field(default="", max_length=300)
+    mode: str = Field(default="test", pattern="^(test|live)$")
 
 class MerchantRazorpaySettingsIn(BaseModel):
     key_id: str = Field(min_length=10, max_length=100)
@@ -136,6 +145,13 @@ def init_db():
             razorpay_key_secret TEXT,
             razorpay_webhook_secret TEXT,
             razorpay_mode TEXT DEFAULT 'test',
+            payment_gateway TEXT DEFAULT 'payu',
+            payu_merchant_id TEXT,
+            payu_client_id TEXT,
+            payu_client_secret TEXT,
+            payu_key TEXT,
+            payu_salt TEXT,
+            payu_mode TEXT DEFAULT 'test',
             active INTEGER NOT NULL DEFAULT 1,
             created_at TEXT NOT NULL
         )""")
@@ -184,6 +200,13 @@ def init_db():
     ensure_column(conn, "merchants", "razorpay_key_secret", "TEXT")
     ensure_column(conn, "merchants", "razorpay_webhook_secret", "TEXT")
     ensure_column(conn, "merchants", "razorpay_mode", "TEXT DEFAULT 'test'" )
+    ensure_column(conn, "merchants", "payment_gateway", "TEXT DEFAULT 'payu'")
+    ensure_column(conn, "merchants", "payu_merchant_id", "TEXT")
+    ensure_column(conn, "merchants", "payu_client_id", "TEXT")
+    ensure_column(conn, "merchants", "payu_client_secret", "TEXT")
+    ensure_column(conn, "merchants", "payu_key", "TEXT")
+    ensure_column(conn, "merchants", "payu_salt", "TEXT")
+    ensure_column(conn, "merchants", "payu_mode", "TEXT DEFAULT 'test'")
     ensure_column(conn, "events", "contact_count", "INTEGER DEFAULT 0")
     ensure_column(conn, "events", "last_contact_at", "TEXT")
     conn.execute(
@@ -398,6 +421,11 @@ def me(merchant: sqlite3.Row = Depends(lambda authorization=Header(default=None)
         "razorpay_mode": merchant["razorpay_mode"] or "test",
         "razorpay_key_id": merchant["razorpay_key_id"] or "",
         "razorpay_webhook_url": f"{PUBLIC_BASE_URL.rstrip('/')}/api/webhooks/razorpay/{merchant['id']}",
+        "payment_gateway": merchant["payment_gateway"] or "payu",
+        "payu_configured": bool(merchant["payu_merchant_id"] and merchant["payu_client_id"] and merchant["payu_client_secret"]),
+        "payu_mode": merchant["payu_mode"] or "test",
+        "payu_merchant_id": merchant["payu_merchant_id"] or "",
+        "payu_webhook_url": f"{PUBLIC_BASE_URL.rstrip('/')}/api/webhooks/payu/{merchant['id']}",
     }
 
 @app.put("/api/auth/email-settings")
@@ -418,6 +446,28 @@ def update_email_settings(payload: MerchantEmailSettingsIn, merchant: sqlite3.Ro
 class EmailTestIn(BaseModel):
     recipient: str = Field(min_length=5, max_length=200)
 
+
+@app.get("/api/integrations/payu/settings")
+def get_payu_settings(merchant: sqlite3.Row = Depends(lambda authorization=Header(default=None): merchant_from_token(authorization))):
+    return {
+        "configured": bool(merchant["payu_merchant_id"] and merchant["payu_client_id"] and merchant["payu_client_secret"]),
+        "mode": merchant["payu_mode"] or "test",
+        "merchant_id": merchant["payu_merchant_id"] or "",
+        "webhook_url": f"{PUBLIC_BASE_URL.rstrip('/')}/api/webhooks/payu/{merchant['id']}",
+        "gateway": merchant["payment_gateway"] or "payu",
+    }
+
+@app.put("/api/integrations/payu/settings")
+def update_payu_settings(payload: MerchantPayUSettingsIn, merchant: sqlite3.Row = Depends(lambda authorization=Header(default=None): merchant_from_token(authorization))):
+    conn = db()
+    conn.execute("UPDATE merchants SET payment_gateway=?, payu_merchant_id=?, payu_client_id=?, payu_client_secret=?, payu_key=?, payu_salt=?, payu_mode=? WHERE id=?", ("payu", payload.merchant_id.strip(), payload.client_id.strip(), payload.client_secret, payload.key, payload.salt, payload.mode, merchant["id"]))
+    conn.commit(); conn.close()
+    audit(None, "payu_settings", "saved", f"PayU {payload.mode} credentials configured.", merchant["id"])
+    return {"ok": True, "configured": True, "mode": payload.mode, "merchant_id": payload.merchant_id.strip(), "webhook_url": f"{PUBLIC_BASE_URL.rstrip('/')}/api/webhooks/payu/{merchant['id']}"}
+
+@app.get("/api/integrations/payu/test-merchant")
+def payu_test_connection_for_merchant(merchant: sqlite3.Row = Depends(lambda authorization=Header(default=None): merchant_from_token(authorization))):
+    return test_payu_connection(merchant["payu_merchant_id"], merchant["payu_client_id"], merchant["payu_client_secret"], merchant["payu_mode"] or "test")
 
 @app.get("/api/integrations/razorpay/settings")
 def get_razorpay_settings(merchant: sqlite3.Row = Depends(lambda authorization=Header(default=None): merchant_from_token(authorization))):
@@ -574,15 +624,27 @@ def execute_event(event_id: str, merchant: sqlite3.Row = Depends(lambda authoriz
         lifecycle = "ESCALATION_REQUIRED"
         message = "Agent escalated the case because the bounded policy requires human approval."
     elif action == "send_payment_link":
-        result = create_payment_link(row["amount"], row["customer"], f"Revive recovery for {row['customer']}", event_id, key_id=merchant["razorpay_key_id"], key_secret=merchant["razorpay_key_secret"])
-        reference = result.get("short_url") or result.get("id")
-        link_id = result.get("id")
-        link_url = result.get("short_url")
-        expires_at = result.get("expire_by")
-        action_payload = result
+        gateway = merchant["payment_gateway"] or "payu"
+        if gateway == "payu":
+            result = create_payu_payment_link(
+                row["amount"], row["customer"], f"Revive recovery for {row['customer']}", event_id,
+                merchant_id=merchant["payu_merchant_id"], client_id=merchant["payu_client_id"], client_secret=merchant["payu_client_secret"],
+                mode=merchant["payu_mode"] or "test", customer_email=row["customer_email"] if "customer_email" in row.keys() else None,
+            )
+            reference = result.get("paymentLink") or result.get("short_url") or result.get("invoiceNumber") or result.get("id")
+            link_id = result.get("invoiceNumber") or result.get("id")
+            link_url = result.get("paymentLink") or result.get("short_url")
+            expires_at = result.get("expiryDate") or result.get("expire_by")
+        else:
+            result = create_payment_link(row["amount"], row["customer"], f"Revive recovery for {row['customer']}", event_id, key_id=merchant["razorpay_key_id"], key_secret=merchant["razorpay_key_secret"])
+            reference = result.get("short_url") or result.get("id")
+            link_id = result.get("id")
+            link_url = result.get("short_url")
+            expires_at = result.get("expire_by")
+        action_payload = {"gateway": gateway, **result}
         status = "EXECUTED"
         lifecycle = "AWAITING_OUTCOME"
-        message = f"Recovery payment link created: {reference}"
+        message = f"{gateway.upper()} recovery payment link created: {reference}"
     else:
         status = "EXECUTED"
         lifecycle = "AWAITING_OUTCOME"
@@ -603,20 +665,25 @@ def execute_event(event_id: str, merchant: sqlite3.Row = Depends(lambda authoriz
 def sync_payment_link(event_id: str, merchant: sqlite3.Row = Depends(lambda authorization=Header(default=None): merchant_from_token(authorization))):
     conn = db(); row = conn.execute("SELECT * FROM events WHERE id=? AND merchant_id=?", (event_id, merchant["id"])).fetchone(); conn.close()
     if not row: raise HTTPException(status_code=404, detail="Event not found")
-    if not row["recovery_link_id"]: raise HTTPException(status_code=400, detail="This event has no Razorpay payment link")
-    if not merchant["razorpay_key_id"] or not merchant["razorpay_key_secret"]:
-        raise HTTPException(status_code=400, detail="Connect Razorpay before syncing a payment link")
+    if not row["recovery_link_id"]: raise HTTPException(status_code=400, detail="This event has no payment link")
+    gateway = merchant["payment_gateway"] or "payu"
     try:
-        remote = fetch_payment_link(row["recovery_link_id"], merchant["razorpay_key_id"], merchant["razorpay_key_secret"])
+        if gateway == "payu":
+            remote = fetch_payu_payment_link(row["recovery_link_id"], merchant["payu_merchant_id"], merchant["payu_client_id"], merchant["payu_client_secret"], merchant["payu_mode"] or "test")
+            status = str(remote.get("status") or remote.get("paymentStatus") or remote.get("payment_status") or "unknown").lower()
+            paid_amount = float(remote.get("amountPaid") or remote.get("paidAmount") or remote.get("totalPaid") or 0)
+            paid = status in {"paid", "success", "successful"} or paid_amount >= float(row["amount"])
+        else:
+            remote = fetch_payment_link(row["recovery_link_id"], merchant["razorpay_key_id"], merchant["razorpay_key_secret"])
+            status = remote.get("status") or "unknown"
+            paid_amount = float(remote.get("amount_paid") or 0) / 100
+            paid = status == "paid" or paid_amount >= float(row["amount"])
     except Exception as exc:
-        raise HTTPException(status_code=502, detail=f"Razorpay payment link sync failed: {exc}") from exc
-    status = remote.get("status") or "unknown"
-    paid_amount = float(remote.get("amount_paid") or 0) / 100
-    paid = status == "paid" or paid_amount >= float(row["amount"])
+        raise HTTPException(status_code=502, detail=f"{gateway.upper()} payment link sync failed: {exc}") from exc
     conn=db()
     if paid:
-        now=datetime.now(timezone.utc).isoformat(); conn.execute("UPDATE events SET action_status='recovered', lifecycle_status='RECOVERED', recovered=1, recovered_at=?, recovered_amount=?, outcome_source='payment_link_sync' WHERE id=?",(now,paid_amount or row["amount"],event_id)); conn.commit(); conn.close(); audit(event_id,"payment_link_synced","recovered",f"Razorpay API reports the payment link is paid.",merchant["id"]); return {"ok":True,"status":status,"recovered":True,"recovered_amount":paid_amount or row["amount"]}
-    conn.execute("UPDATE events SET action_payload=? WHERE id=?", (json.dumps({"payment_link_sync": remote}), event_id)); conn.commit(); conn.close(); audit(event_id,"payment_link_synced","checked",f"Razorpay API reports payment link status: {status}.",merchant["id"]); return {"ok":True,"status":status,"recovered":False,"recovered_amount":paid_amount}
+        now=datetime.now(timezone.utc).isoformat(); conn.execute("UPDATE events SET action_status='recovered', lifecycle_status='RECOVERED', recovered=1, recovered_at=?, recovered_amount=?, outcome_source=? WHERE id=?",(now,paid_amount or row["amount"],f"{gateway}_payment_link_sync",event_id)); conn.commit(); conn.close(); audit(event_id,"payment_link_synced","recovered",f"{gateway.upper()} reports the payment link is paid.",merchant["id"]); return {"ok":True,"gateway":gateway,"status":status,"recovered":True,"recovered_amount":paid_amount or row["amount"]}
+    conn.execute("UPDATE events SET action_payload=? WHERE id=?", (json.dumps({"payment_link_sync": remote}), event_id)); conn.commit(); conn.close(); audit(event_id,"payment_link_synced","checked",f"{gateway.upper()} reports payment link status: {status}.",merchant["id"]); return {"ok":True,"gateway":gateway,"status":status,"recovered":False,"recovered_amount":paid_amount}
 
 
 @app.post("/api/events/{event_id}/confirm-recovered")
@@ -699,6 +766,25 @@ def process_razorpay_payload(payload: dict[str, Any], merchant_id: str):
     audit(event_id, "webhook", "ingested", f"Razorpay event {event_name} ingested.", merchant_id)
     return {"ok": True, "event_id": event_id, "recommended_action": decision.recommended_action, "recovery_probability": decision.recovery_probability, "lifecycle_status": "RECOMMENDED"}
 
+
+@app.post("/api/webhooks/payu/{merchant_id}")
+async def payu_webhook(merchant_id: str, request: Request):
+    conn = db(); merchant = conn.execute("SELECT * FROM merchants WHERE id=? AND active=1", (merchant_id,)).fetchone(); conn.close()
+    if not merchant: raise HTTPException(status_code=404, detail="Merchant account not found")
+    form = dict(await request.form())
+    payload = {k: str(v) for k,v in form.items()}
+    if merchant["payu_salt"] and not verify_payu_response_hash(payload, merchant["payu_salt"]):
+        raise HTTPException(status_code=401, detail="Invalid PayU response hash")
+    event_key = payload.get("mihpayid") or payload.get("txnid") or str(uuid.uuid4())
+    conn=db(); existing=conn.execute("SELECT id FROM webhook_events WHERE source=? AND external_id=?",("payu",event_key)).fetchone()
+    if existing: conn.close(); return {"ok":True,"deduplicated":True}
+    conn.execute("INSERT INTO webhook_events(id,source,event_name,external_id,received_at,payload) VALUES(?,?,?,?,?,?)",(f"payu_{uuid.uuid4().hex[:10]}","payu",payload.get("status", "unknown"),event_key,datetime.now(timezone.utc).isoformat(),json.dumps(payload))); conn.commit(); conn.close()
+    reference = payload.get("udf1") or payload.get("txnid")
+    status = (payload.get("status") or "").lower()
+    conn=db(); row=conn.execute("SELECT * FROM events WHERE merchant_id=? AND (id=? OR action_reference=? OR external_id=?) ORDER BY created_at DESC LIMIT 1",(merchant_id,reference,payload.get("txnid"),payload.get("txnid"))).fetchone()
+    if row and status == "success":
+        amount=float(payload.get("amount") or row["amount"]); now=datetime.now(timezone.utc).isoformat(); conn.execute("UPDATE events SET action_status='recovered', lifecycle_status='RECOVERED', recovered=1, recovered_at=?, recovered_amount=?, outcome_source='payu_webhook' WHERE id=?",(now,amount,row["id"])); conn.commit(); conn.close(); audit(row["id"],"payu_webhook","recovered","PayU confirmed a successful payment.",merchant_id); return {"ok":True,"recovered":True,"event_id":row["id"]}
+    conn.close(); audit(row["id"] if row else None,"payu_webhook","ingested",f"PayU payment status: {status}",merchant_id); return {"ok":True,"recovered":False,"status":status}
 
 @app.post("/api/webhooks/razorpay")
 async def razorpay_webhook(request: Request, x_razorpay_signature: str | None = Header(default=None), x_revive_merchant_id: str | None = Header(default=None)):

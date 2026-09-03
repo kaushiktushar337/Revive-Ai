@@ -211,3 +211,29 @@ Open `http://127.0.0.1:5500`.
 6. Create a real Test Mode Payment Link from a Revive recovery action. Razorpay Payment Links are API-created URLs that can be paid with supported test payment methods.
 7. After payment, use the event's “Sync payment status” control if the webhook cannot reach localhost; otherwise the webhook should reconcile automatically.
 8. Never put Live credentials in a demo environment. Keep secrets out of source control.
+
+## Frontend update
+The frontend has been replaced with the Deep Intelligence / Stitch modern UI reference design. It keeps the full prototype functionality: merchant auth, overview metrics, risk, recovery actions, Razorpay connector, invoice CSV import, checkout scanner simulation, email sender settings/test, payment-link sync, and audit logs embedded in Overview (no separate Audit tab).
+
+Run frontend with:
+`python -m http.server 5500 --directory frontend`
+
+## PayU Test Mode
+
+Revive uses PayU as the primary payment gateway for recovery Payment Links. The integration uses PayU's OAuth 2.0 Client Credentials flow and the Test/UAT Payment Links API.
+
+Configure these merchant fields in **Settings → PayU payment gateway**:
+- Merchant ID
+- Client ID
+- Client Secret
+- Test/Product Key (optional for hosted checkout)
+- Salt (used for response-hash verification)
+
+PayU's documented Test/UAT Payment Links endpoint is `https://uatoneapi.payu.in/payment-links`, and access tokens are obtained from `https://uat-accounts.payu.in/oauth/token` with the appropriate payment-link scopes.
+
+PayU payment webhooks should be configured at:
+`<PUBLIC_BASE_URL>/api/webhooks/payu/<merchant_id>`
+
+The webhook handler validates the PayU response hash before accepting a successful payment.
+
+For a real sandbox payment, use PayU's Test credentials/cards/UPI values documented in their Test Integration guide. UPI intent/in-app flows are not available in Test Mode.
