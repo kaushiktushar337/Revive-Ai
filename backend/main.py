@@ -71,10 +71,8 @@ class MerchantSignupIn(BaseModel):
     password: str = Field(min_length=8, max_length=200)
     sender_email: str = Field(min_length=5, max_length=200)
     use_demo_email: bool = True
-    smtp_host: str | None = None
-    smtp_port: int = Field(default=587, ge=1, le=65535)
-    smtp_username: str | None = None
-    smtp_password: str | None = None
+    email_provider: str = Field(default="demo", pattern="^(demo|resend)$")
+    resend_api_key: str | None = Field(default=None, max_length=300)
 
 class MerchantLoginIn(BaseModel):
     login_email: str
@@ -100,10 +98,8 @@ class ActiveGatewayIn(BaseModel):
 class MerchantEmailSettingsIn(BaseModel):
     sender_email: str = Field(min_length=5, max_length=200)
     use_demo_email: bool = True
-    smtp_host: str | None = None
-    smtp_port: int = Field(default=587, ge=1, le=65535)
-    smtp_username: str | None = None
-    smtp_password: str | None = None
+    email_provider: str = Field(default="demo", pattern="^(demo|resend)$")
+    resend_api_key: str | None = Field(default=None, max_length=300)
 
 
 def merchant_from_token(authorization: str | None) -> sqlite3.Row:
@@ -203,6 +199,8 @@ def init_db():
             password_hash TEXT NOT NULL,
             sender_email TEXT NOT NULL,
             use_demo_email INTEGER NOT NULL DEFAULT 1,
+            email_provider TEXT NOT NULL DEFAULT 'demo',
+            resend_api_key TEXT,
             smtp_host TEXT,
             smtp_port INTEGER DEFAULT 587,
             smtp_username TEXT,
@@ -305,6 +303,10 @@ def init_db():
     conn.execute("CREATE INDEX IF NOT EXISTS idx_customers_merchant ON customers(merchant_id)")
     ensure_column(conn, "events", "customer_email", "TEXT")
     ensure_column(conn, "events", "consent_to_email", "INTEGER DEFAULT 0")
+    ensure_column(conn, "merchants", "email_provider", "TEXT DEFAULT 'demo'")
+    ensure_column(conn, "merchants", "resend_api_key", "TEXT")
+    # Migrate legacy SMTP/non-demo merchants to Resend as the hosted provider.
+    conn.execute("UPDATE merchants SET email_provider=CASE WHEN use_demo_email=1 THEN 'demo' ELSE 'resend' END WHERE email_provider IS NULL OR email_provider='' OR (email_provider='demo' AND use_demo_email=0)")
     ensure_column(conn, "merchants", "razorpay_key_id", "TEXT")
     ensure_column(conn, "merchants", "razorpay_key_secret", "TEXT")
     ensure_column(conn, "merchants", "razorpay_webhook_secret", "TEXT")
@@ -517,11 +519,14 @@ def register_merchant(payload: MerchantSignupIn):
         conn.close(); raise HTTPException(status_code=409, detail="An account with this login email already exists")
     merchant_id = f"m_{uuid.uuid4().hex[:10]}"
     now = datetime.now(timezone.utc).isoformat()
-    conn.execute("INSERT INTO merchants(id,business_name,login_email,password_hash,sender_email,use_demo_email,smtp_host,smtp_port,smtp_username,smtp_password,active,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)", (merchant_id,payload.business_name.strip(),email,hash_password(payload.password),sender,1 if payload.use_demo_email else 0,payload.smtp_host,payload.smtp_port,payload.smtp_username,payload.smtp_password,1,now))
+    provider = "demo" if payload.use_demo_email else payload.email_provider
+    if provider == "resend" and not payload.resend_api_key:
+        conn.close(); raise HTTPException(status_code=400, detail="Resend mode requires a Resend API key")
+    conn.execute("INSERT INTO merchants(id,business_name,login_email,password_hash,sender_email,use_demo_email,email_provider,resend_api_key,active,created_at) VALUES(?,?,?,?,?,?,?,?,?,?)", (merchant_id,payload.business_name.strip(),email,hash_password(payload.password),sender,1 if provider == "demo" else 0,provider,payload.resend_api_key or None,1,now))
     conn.execute("INSERT INTO users(id,merchant_id,email,role,created_at,active) VALUES(?,?,?,?,?,?)", (f"u_{uuid.uuid4().hex[:10]}", merchant_id, email, "owner", now, 1))
     conn.commit(); conn.close()
     token = issue_token(merchant_id)
-    return {"ok": True, "token": token, "merchant": {"id": merchant_id, "business_name": payload.business_name.strip(), "login_email": email, "sender_email": sender, "use_demo_email": payload.use_demo_email}}
+    return {"ok": True, "token": token, "merchant": {"id": merchant_id, "business_name": payload.business_name.strip(), "login_email": email, "sender_email": sender, "use_demo_email": provider == "demo", "email_provider": provider}}
 
 @app.post("/api/auth/login")
 def login_merchant(payload: MerchantLoginIn):
@@ -529,7 +534,7 @@ def login_merchant(payload: MerchantLoginIn):
     if not row or not verify_password(payload.password, row["password_hash"]):
         raise HTTPException(status_code=401, detail="Invalid login email or password")
     token = issue_token(row["id"])
-    return {"ok": True, "token": token, "merchant": {"id": row["id"], "business_name": row["business_name"], "login_email": row["login_email"], "sender_email": row["sender_email"], "use_demo_email": bool(row["use_demo_email"])}}
+    return {"ok": True, "token": token, "merchant": {"id": row["id"], "business_name": row["business_name"], "login_email": row["login_email"], "sender_email": row["sender_email"], "use_demo_email": bool(row["use_demo_email"]), "email_provider": row["email_provider"] or ("demo" if row["use_demo_email"] else "resend")}}
 
 @app.get("/api/auth/me")
 def me(merchant: sqlite3.Row = Depends(lambda authorization=Header(default=None): merchant_from_token(authorization))):
@@ -539,10 +544,9 @@ def me(merchant: sqlite3.Row = Depends(lambda authorization=Header(default=None)
         "login_email": merchant["login_email"],
         "sender_email": merchant["sender_email"],
         "use_demo_email": bool(merchant["use_demo_email"]),
-        "smtp_host": merchant["smtp_host"],
-        "smtp_port": merchant["smtp_port"],
-        "smtp_username": merchant["smtp_username"],
-        "smtp_configured": bool(merchant["smtp_host"] and merchant["smtp_username"] and merchant["smtp_password"]),
+        "email_provider": merchant["email_provider"] or ("demo" if merchant["use_demo_email"] else "resend"),
+        "resend_configured": bool(merchant["resend_api_key"]),
+        "smtp_configured": False,
         "razorpay_configured": bool(merchant["razorpay_key_id"] and merchant["razorpay_key_secret"]),
         "razorpay_webhook_configured": bool(merchant["razorpay_webhook_secret"]),
         "razorpay_mode": merchant["razorpay_mode"] or "test",
@@ -558,16 +562,17 @@ def me(merchant: sqlite3.Row = Depends(lambda authorization=Header(default=None)
 @app.put("/api/auth/email-settings")
 def update_email_settings(payload: MerchantEmailSettingsIn, merchant: sqlite3.Row = Depends(lambda authorization=Header(default=None): merchant_from_token(authorization))):
     sender = payload.sender_email.strip().lower()
-    if not payload.use_demo_email:
-        if not payload.smtp_host or not payload.smtp_username or not payload.smtp_password:
-            raise HTTPException(status_code=400, detail="Real SMTP mode requires SMTP host, username, and password/app password")
+    provider = "demo" if payload.use_demo_email else payload.email_provider
+    if provider == "resend" and not (payload.resend_api_key or merchant["resend_api_key"]):
+        raise HTTPException(status_code=400, detail="Resend mode requires a Resend API key")
     conn = db()
     conn.execute(
-        "UPDATE merchants SET sender_email=?,use_demo_email=?,smtp_host=?,smtp_port=?,smtp_username=?,smtp_password=COALESCE(?, smtp_password) WHERE id=?",
-        (sender,1 if payload.use_demo_email else 0,payload.smtp_host,payload.smtp_port,payload.smtp_username,payload.smtp_password or None,merchant["id"]),
+        "UPDATE merchants SET sender_email=?,use_demo_email=?,email_provider=?,resend_api_key=COALESCE(?, resend_api_key) WHERE id=?",
+        (sender,1 if provider == "demo" else 0,provider,payload.resend_api_key or None,merchant["id"]),
     )
     conn.commit(); conn.close()
-    return {"ok": True, "sender_email": sender, "use_demo_email": payload.use_demo_email}
+    audit(None, "email_settings", "saved", f"Email provider set to {provider}.", merchant["id"])
+    return {"ok": True, "sender_email": sender, "use_demo_email": provider == "demo", "email_provider": provider}
 
 
 class EmailTestIn(BaseModel):
@@ -656,26 +661,29 @@ def test_email_delivery(payload: EmailTestIn, merchant: sqlite3.Row = Depends(la
         raise HTTPException(status_code=400, detail="Enter a valid test recipient email")
     if not merchant["sender_email"]:
         raise HTTPException(status_code=400, detail="Set a recovery sender email first")
-    if not merchant["use_demo_email"] and not (merchant["smtp_host"] and merchant["smtp_username"] and merchant["smtp_password"]):
-        raise HTTPException(status_code=400, detail="Configure SMTP before sending a real test email")
+    provider = merchant["email_provider"] or ("demo" if merchant["use_demo_email"] else "resend")
+    if provider == "resend" and not merchant["resend_api_key"]:
+        raise HTTPException(status_code=400, detail="Configure a Resend API key before sending a real test email")
 
     subject = "ReviveAI test email"
     body = (
         f"Hi {merchant['business_name']},\n\n"
         "This is a test email from ReviveAI. Your recovery sender configuration is working.\n\n"
         f"Sender: {merchant['sender_email']}\n"
-        f"Mode: {'Demo' if merchant['use_demo_email'] else 'SMTP'}\n\n"
+        f"Mode: {provider.upper()}\n\n"
         "You can now use ReviveAI to send recovery emails.\n"
     )
     result = send_email(
         recipient, subject, body,
         {
             "from_email": merchant["sender_email"],
-            "mocked": bool(merchant["use_demo_email"]),
-            "smtp_host": merchant["smtp_host"],
-            "smtp_port": merchant["smtp_port"],
-            "smtp_username": merchant["smtp_username"],
-            "smtp_password": merchant["smtp_password"],
+            "mocked": provider == "demo",
+            "provider": provider,
+            "resend_api_key": merchant["resend_api_key"],
+            "smtp_host": None,
+            "smtp_port": 587,
+            "smtp_username": None,
+            "smtp_password": None,
         },
     )
     audit(None, "email_test", "sent" if result.get("ok") else "failed", f"Test email {'sent' if result.get('ok') else 'failed'} to {recipient}.", merchant["id"])
@@ -1275,7 +1283,10 @@ def send_recovery_email(payload: RecoveryEmailIn, merchant: sqlite3.Row = Depend
     if row["contact_count"] >= 3:
         conn.close(); raise HTTPException(status_code=429, detail="Contact limit reached")
     subject, body = _email_content(row)
-    result = send_email(payload.recipient, subject, body, {"from_email": merchant["sender_email"], "mocked": bool(merchant["use_demo_email"]), "smtp_host": merchant["smtp_host"], "smtp_port": merchant["smtp_port"], "smtp_username": merchant["smtp_username"], "smtp_password": merchant["smtp_password"]})
+    provider = merchant["email_provider"] or ("demo" if merchant["use_demo_email"] else "resend")
+    if provider == "resend" and not merchant["resend_api_key"]:
+        raise HTTPException(status_code=400, detail="Configure a Resend API key before sending a recovery email")
+    result = send_email(payload.recipient, subject, body, {"from_email": merchant["sender_email"], "mocked": provider == "demo", "provider": provider, "resend_api_key": merchant["resend_api_key"], "smtp_host": None, "smtp_port": 587, "smtp_username": None, "smtp_password": None})
     now = datetime.now(timezone.utc).isoformat()
     if result.get("ok"):
         conn.execute("UPDATE events SET customer_email=?, consent_to_email=1, contact_count=COALESCE(contact_count,0)+1, last_contact_at=?, action_status='EXECUTED', lifecycle_status='AWAITING_OUTCOME', action_reference=? WHERE id=?", (payload.recipient, now, result.get("message_id"), payload.event_id))
@@ -1284,7 +1295,7 @@ def send_recovery_email(payload: RecoveryEmailIn, merchant: sqlite3.Row = Depend
     audit(payload.event_id, "email_recovery", "sent" if result.get("ok") else "failed", f"Recovery email {'sent' if result.get('ok') else 'failed'} to {payload.recipient}.")
     if not result.get("ok"):
         raise HTTPException(status_code=502, detail=result.get("error", "Email send failed"))
-    return {"ok": True, "event_id": payload.event_id, "recipient": payload.recipient, "subject": subject, "message_id": result.get("message_id"), "mocked": result.get("mocked", False)}
+    return {"ok": True, "event_id": payload.event_id, "recipient": payload.recipient, "subject": subject, "message_id": result.get("message_id"), "mocked": result.get("mocked", False), "provider": result.get("provider", provider)}
 
 
 @app.post("/api/reset")
