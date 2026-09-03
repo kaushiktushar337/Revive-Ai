@@ -60,8 +60,10 @@ def create_payment_link(amount_inr: float, customer: str, description: str, refe
     if MOCK_EXTERNAL_ACTIONS or not RAZORPAY_KEY_ID or not RAZORPAY_KEY_SECRET:
         return {
             "mode": "demo",
+            "id": f"plink_demo_{reference_id}",
             "short_url": f"http://localhost:5500/pay/{reference_id}",
             "reference_id": reference_id,
+            "status": "created",
         }
 
     payload = {
@@ -70,8 +72,9 @@ def create_payment_link(amount_inr: float, customer: str, description: str, refe
         "description": description,
         "reference_id": reference_id[:40],
         "customer": {"name": customer},
-        "notify": {"sms": False, "email": False},
+        "notify": {"sms": False, "email": False, "whatsapp": False},
         "reminder_enable": True,
+        "notes": {"revive_event_id": reference_id[:40]},
     }
     response = _request("POST", "/payment_links", json=payload)
     response.raise_for_status()
