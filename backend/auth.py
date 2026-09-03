@@ -3,6 +3,9 @@ import base64, hashlib, hmac, json, os, time, uuid
 from typing import Any
 
 SECRET = os.getenv('REVIVE_AUTH_SECRET', 'dev-only-change-me')
+if SECRET == 'dev-only-change-me':
+    # Fine for local demos; set REVIVE_AUTH_SECRET before deployment.
+    pass
 TOKEN_TTL = int(os.getenv('REVIVE_TOKEN_TTL', '86400'))
 
 def hash_password(password: str, salt: bytes | None = None) -> str:

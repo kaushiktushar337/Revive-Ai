@@ -54,20 +54,19 @@ class MerchantLoginIn(BaseModel):
 class MerchantPayUSettingsIn(BaseModel):
     merchant_id: str = Field(min_length=3, max_length=100)
     client_id: str = Field(min_length=5, max_length=200)
-    client_secret: str = Field(min_length=5, max_length=300)
-    key: str = Field(default="", max_length=100)
-    salt: str = Field(default="", max_length=300)
+    client_secret: str | None = Field(default=None, max_length=300)
+    key: str | None = Field(default=None, max_length=100)
+    salt: str | None = Field(default=None, max_length=300)
     mode: str = Field(default="test", pattern="^(test|live)$")
 
 class MerchantRazorpaySettingsIn(BaseModel):
     key_id: str = Field(min_length=10, max_length=100)
-    key_secret: str = Field(min_length=10, max_length=200)
-    webhook_secret: str = Field(min_length=8, max_length=200)
+    key_secret: str | None = Field(default=None, max_length=200)
+    webhook_secret: str | None = Field(default=None, max_length=200)
     mode: str = Field(default="test", pattern="^(test|live)$")
 
 class ActiveGatewayIn(BaseModel):
     gateway: str = Field(pattern="^(payu|razorpay)$")
-
 
 class MerchantEmailSettingsIn(BaseModel):
     sender_email: str = Field(min_length=5, max_length=200)
@@ -78,7 +77,7 @@ class MerchantEmailSettingsIn(BaseModel):
     smtp_password: str | None = None
 
 
-def merchant_from_token(authorization: str | None = Header(default=None)) -> sqlite3.Row:
+def merchant_from_token(authorization: str | None) -> sqlite3.Row:
     if not authorization or not authorization.lower().startswith('bearer '):
         raise HTTPException(status_code=401, detail='Authentication required')
     payload = verify_token(authorization.split(' ', 1)[1].strip())
@@ -197,6 +196,7 @@ def init_db():
     ensure_column(conn, "events", "recovered_at", "TEXT")
     ensure_column(conn, "events", "recovered_amount", "REAL")
     ensure_column(conn, "events", "outcome_source", "TEXT")
+    ensure_column(conn, "events", "payment_gateway", "TEXT")
     conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_events_external_id ON events(external_id) WHERE external_id IS NOT NULL")
     ensure_column(conn, "events", "customer_email", "TEXT")
     ensure_column(conn, "events", "consent_to_email", "INTEGER DEFAULT 0")
@@ -281,8 +281,8 @@ def insert_event(event: dict[str, Any], decision, merchant_id: str = "m_demo"):
     conn = db()
     conn.execute(
         """INSERT OR REPLACE INTO events
-        (id,merchant_id,event_type,customer,amount,currency,status,recovery_probability,risk_score,recommended_action,action_reason,risk_reason,delay_hours,created_at,action_status,recovered,external_id,source,action_reference,action_payload,lifecycle_status,recovery_link_id,recovery_link_url,recovery_expires_at,recovered_at,recovered_amount,outcome_source,customer_email,consent_to_email)
-        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+        (id,merchant_id,event_type,customer,amount,currency,status,recovery_probability,risk_score,recommended_action,action_reason,risk_reason,delay_hours,created_at,action_status,recovered,external_id,source,action_reference,action_payload,lifecycle_status,recovery_link_id,recovery_link_url,recovery_expires_at,recovered_at,recovered_amount,outcome_source,payment_gateway,customer_email,consent_to_email)
+        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
         (
             event_id,
             merchant_id,
@@ -311,6 +311,7 @@ def insert_event(event: dict[str, Any], decision, merchant_id: str = "m_demo"):
             None,
             None,
             None,
+            event.get("payment_gateway"),
             event.get("customer_email"),
             1 if event.get("consent_to_email") else 0,
         ),
@@ -440,8 +441,8 @@ def update_email_settings(payload: MerchantEmailSettingsIn, merchant: sqlite3.Ro
             raise HTTPException(status_code=400, detail="Real SMTP mode requires SMTP host, username, and password/app password")
     conn = db()
     conn.execute(
-        "UPDATE merchants SET sender_email=?,use_demo_email=?,smtp_host=?,smtp_port=?,smtp_username=?,smtp_password=? WHERE id=?",
-        (sender,1 if payload.use_demo_email else 0,payload.smtp_host,payload.smtp_port,payload.smtp_username,payload.smtp_password,merchant["id"]),
+        "UPDATE merchants SET sender_email=?,use_demo_email=?,smtp_host=?,smtp_port=?,smtp_username=?,smtp_password=COALESCE(?, smtp_password) WHERE id=?",
+        (sender,1 if payload.use_demo_email else 0,payload.smtp_host,payload.smtp_port,payload.smtp_username,payload.smtp_password or None,merchant["id"]),
     )
     conn.commit(); conn.close()
     return {"ok": True, "sender_email": sender, "use_demo_email": payload.use_demo_email}
@@ -464,7 +465,13 @@ def get_payu_settings(merchant: sqlite3.Row = Depends(lambda authorization=Heade
 @app.put("/api/integrations/payu/settings")
 def update_payu_settings(payload: MerchantPayUSettingsIn, merchant: sqlite3.Row = Depends(lambda authorization=Header(default=None): merchant_from_token(authorization))):
     conn = db()
-    conn.execute("UPDATE merchants SET payment_gateway=?, payu_merchant_id=?, payu_client_id=?, payu_client_secret=?, payu_key=?, payu_salt=?, payu_mode=? WHERE id=?", ("payu", payload.merchant_id.strip(), payload.client_id.strip(), payload.client_secret, payload.key, payload.salt, payload.mode, merchant["id"]))
+    conn.execute(
+        """UPDATE merchants SET payment_gateway=?, payu_merchant_id=?, payu_client_id=?,
+           payu_client_secret=COALESCE(?, payu_client_secret), payu_key=COALESCE(?, payu_key),
+           payu_salt=COALESCE(?, payu_salt), payu_mode=? WHERE id=?""",
+        ("payu", payload.merchant_id.strip(), payload.client_id.strip(), payload.client_secret or None,
+         payload.key if payload.key else None, payload.salt if payload.salt else None, payload.mode, merchant["id"]),
+    )
     conn.commit(); conn.close()
     audit(None, "payu_settings", "saved", f"PayU {payload.mode} credentials configured.", merchant["id"])
     return {"ok": True, "configured": True, "mode": payload.mode, "merchant_id": payload.merchant_id.strip(), "webhook_url": f"{PUBLIC_BASE_URL.rstrip('/')}/api/webhooks/payu/{merchant['id']}"}
@@ -490,49 +497,31 @@ def update_razorpay_settings(payload: MerchantRazorpaySettingsIn, merchant: sqli
     if payload.mode == "live" and not payload.key_id.startswith("rzp_live_"):
         raise HTTPException(status_code=400, detail="Live mode requires a Razorpay live key ID starting with rzp_live_.")
     conn = db()
-    conn.execute("UPDATE merchants SET razorpay_key_id=?, razorpay_key_secret=?, razorpay_webhook_secret=?, razorpay_mode=? WHERE id=?", (payload.key_id.strip(), payload.key_secret, payload.webhook_secret, payload.mode, merchant["id"]))
+    conn.execute(
+        """UPDATE merchants SET razorpay_key_id=?,
+           razorpay_key_secret=COALESCE(?, razorpay_key_secret),
+           razorpay_webhook_secret=COALESCE(?, razorpay_webhook_secret),
+           razorpay_mode=?, payment_gateway='razorpay' WHERE id=?""",
+        (payload.key_id.strip(), payload.key_secret or None, payload.webhook_secret or None, payload.mode, merchant["id"]),
+    )
     conn.commit(); conn.close()
-    audit(None, "razorpay_settings", "saved", f"Razorpay {payload.mode} credentials configured.", merchant["id"])
-    return {"ok": True, "configured": True, "mode": payload.mode, "key_id": payload.key_id.strip(), "webhook_url": f"{PUBLIC_BASE_URL.rstrip('/')}/api/webhooks/razorpay/{merchant['id']}"}
+    audit(None, "razorpay_settings", "saved", f"Razorpay {payload.mode} credentials configured and gateway activated.", merchant["id"])
+    return {"ok": True, "configured": True, "mode": payload.mode, "key_id": payload.key_id.strip(), "gateway": "razorpay", "webhook_url": f"{PUBLIC_BASE_URL.rstrip('/')}/api/webhooks/razorpay/{merchant['id']}"}
 
 @app.put("/api/integrations/payment-gateway")
-def set_active_gateway(
-    payload: ActiveGatewayIn,
-    merchant: sqlite3.Row = Depends(merchant_from_token),
-):
-    gateway = payload.gateway
-
-    if gateway == "payu":
-        configured = bool(
-            merchant["payu_merchant_id"]
-            and merchant["payu_client_id"]
-            and merchant["payu_client_secret"]
-        )
-    else:
-        configured = bool(
-            merchant["razorpay_key_id"]
-            and merchant["razorpay_key_secret"]
-        )
-
-    if not configured:
-        raise HTTPException(
-            status_code=400,
-            detail=f"{gateway} is not configured",
-        )
-
+def set_active_gateway(payload: ActiveGatewayIn, merchant: sqlite3.Row = Depends(lambda authorization=Header(default=None): merchant_from_token(authorization))):
     conn = db()
-    try:
-        conn.execute(
-            "UPDATE merchants SET payment_gateway=? WHERE id=?",
-            (gateway, merchant["id"]),
-        )
-        conn.commit()
-    finally:
+    if payload.gateway == "payu":
+        configured = bool(merchant["payu_merchant_id"] and merchant["payu_client_id"] and merchant["payu_client_secret"])
+    else:
+        configured = bool(merchant["razorpay_key_id"] and merchant["razorpay_key_secret"])
+    if not configured:
         conn.close()
-
-    return {"ok": True, "gateway": gateway}
-
-
+        raise HTTPException(status_code=400, detail=f"Configure {payload.gateway.upper()} credentials before activating it.")
+    conn.execute("UPDATE merchants SET payment_gateway=? WHERE id=?", (payload.gateway, merchant["id"]))
+    conn.commit(); conn.close()
+    audit(None, "payment_gateway", "activated", f"{payload.gateway.upper()} is now the active payment gateway.", merchant["id"])
+    return {"ok": True, "gateway": payload.gateway}
 
 @app.get("/api/integrations/razorpay/test-merchant")
 def razorpay_test_connection_for_merchant(merchant: sqlite3.Row = Depends(lambda authorization=Header(default=None): merchant_from_token(authorization))):
@@ -629,6 +618,7 @@ def get_audit(limit: int = 100, merchant: sqlite3.Row = Depends(lambda authoriza
 @app.post("/api/events")
 def create_event(event: EventIn, merchant: sqlite3.Row = Depends(lambda authorization=Header(default=None): merchant_from_token(authorization))):
     payload = event.model_dump()
+    payload["payment_gateway"] = merchant["payment_gateway"] or "payu"
     if not payload["customer_value"]:
         payload["customer_value"] = payload["amount"]
     if payload.get("external_id"):
@@ -651,6 +641,7 @@ def execute_event(event_id: str, merchant: sqlite3.Row = Depends(lambda authoriz
         raise HTTPException(status_code=404, detail="Event not found")
 
     action = row["recommended_action"]
+    event_gateway = row["payment_gateway"] or merchant["payment_gateway"] or "payu"
     action_payload: dict[str, Any] = {}
     status = "STOPPED"
     lifecycle = "NO_ACTION"
@@ -667,7 +658,7 @@ def execute_event(event_id: str, merchant: sqlite3.Row = Depends(lambda authoriz
         lifecycle = "ESCALATION_REQUIRED"
         message = "Agent escalated the case because the bounded policy requires human approval."
     elif action == "send_payment_link":
-        gateway = merchant["payment_gateway"] or "payu"
+        gateway = event_gateway
         if gateway == "payu":
             result = create_payu_payment_link(
                 row["amount"], row["customer"], f"Revive recovery for {row['customer']}", event_id,
@@ -695,8 +686,8 @@ def execute_event(event_id: str, merchant: sqlite3.Row = Depends(lambda authoriz
 
     conn = db()
     conn.execute(
-        "UPDATE events SET action_status=?, action_reference=?, action_payload=?, lifecycle_status=?, recovery_link_id=COALESCE(?, recovery_link_id), recovery_link_url=COALESCE(?, recovery_link_url), recovery_expires_at=COALESCE(?, recovery_expires_at) WHERE id=?",
-        (status, reference, json.dumps(action_payload) if action_payload else None, lifecycle, link_id, link_url, str(expires_at) if expires_at else None, event_id),
+        "UPDATE events SET payment_gateway=?, action_status=?, action_reference=?, action_payload=?, lifecycle_status=?, recovery_link_id=COALESCE(?, recovery_link_id), recovery_link_url=COALESCE(?, recovery_link_url), recovery_expires_at=COALESCE(?, recovery_expires_at) WHERE id=?",
+        (event_gateway, status, reference, json.dumps(action_payload) if action_payload else None, lifecycle, link_id, link_url, str(expires_at) if expires_at else None, event_id),
     )
     conn.commit()
     conn.close()
@@ -709,7 +700,7 @@ def sync_payment_link(event_id: str, merchant: sqlite3.Row = Depends(lambda auth
     conn = db(); row = conn.execute("SELECT * FROM events WHERE id=? AND merchant_id=?", (event_id, merchant["id"])).fetchone(); conn.close()
     if not row: raise HTTPException(status_code=404, detail="Event not found")
     if not row["recovery_link_id"]: raise HTTPException(status_code=400, detail="This event has no payment link")
-    gateway = merchant["payment_gateway"] or "payu"
+    gateway = row["payment_gateway"] or merchant["payment_gateway"] or "payu"
     try:
         if gateway == "payu":
             remote = fetch_payu_payment_link(row["recovery_link_id"], merchant["payu_merchant_id"], merchant["payu_client_id"], merchant["payu_client_secret"], merchant["payu_mode"] or "test")
@@ -748,6 +739,8 @@ def process_razorpay_payload(payload: dict[str, Any], merchant_id: str):
     event_name = payload.get("event", "unknown")
     webhook_external_id = payload.get("id") or f"wh_{uuid.uuid4().hex[:10]}"
     internal = event_payload_to_internal(payload)
+    if internal:
+        internal["payment_gateway"] = "razorpay"
     conn = db()
     existing = conn.execute("SELECT id FROM webhook_events WHERE source=? AND external_id=?", ("razorpay", webhook_external_id)).fetchone()
     if existing:
