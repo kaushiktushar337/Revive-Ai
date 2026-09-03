@@ -65,6 +65,10 @@ class MerchantRazorpaySettingsIn(BaseModel):
     webhook_secret: str = Field(min_length=8, max_length=200)
     mode: str = Field(default="test", pattern="^(test|live)$")
 
+class ActiveGatewayIn(BaseModel):
+    gateway: str = Field(pattern="^(payu|razorpay)$")
+
+
 class MerchantEmailSettingsIn(BaseModel):
     sender_email: str = Field(min_length=5, max_length=200)
     use_demo_email: bool = True
@@ -74,7 +78,7 @@ class MerchantEmailSettingsIn(BaseModel):
     smtp_password: str | None = None
 
 
-def merchant_from_token(authorization: str | None) -> sqlite3.Row:
+def merchant_from_token(authorization: str | None = Header(default=None)) -> sqlite3.Row:
     if not authorization or not authorization.lower().startswith('bearer '):
         raise HTTPException(status_code=401, detail='Authentication required')
     payload = verify_token(authorization.split(' ', 1)[1].strip())
@@ -490,6 +494,45 @@ def update_razorpay_settings(payload: MerchantRazorpaySettingsIn, merchant: sqli
     conn.commit(); conn.close()
     audit(None, "razorpay_settings", "saved", f"Razorpay {payload.mode} credentials configured.", merchant["id"])
     return {"ok": True, "configured": True, "mode": payload.mode, "key_id": payload.key_id.strip(), "webhook_url": f"{PUBLIC_BASE_URL.rstrip('/')}/api/webhooks/razorpay/{merchant['id']}"}
+
+@app.put("/api/integrations/payment-gateway")
+def set_active_gateway(
+    payload: ActiveGatewayIn,
+    merchant: sqlite3.Row = Depends(merchant_from_token),
+):
+    gateway = payload.gateway
+
+    if gateway == "payu":
+        configured = bool(
+            merchant["payu_merchant_id"]
+            and merchant["payu_client_id"]
+            and merchant["payu_client_secret"]
+        )
+    else:
+        configured = bool(
+            merchant["razorpay_key_id"]
+            and merchant["razorpay_key_secret"]
+        )
+
+    if not configured:
+        raise HTTPException(
+            status_code=400,
+            detail=f"{gateway} is not configured",
+        )
+
+    conn = db()
+    try:
+        conn.execute(
+            "UPDATE merchants SET payment_gateway=? WHERE id=?",
+            (gateway, merchant["id"]),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    return {"ok": True, "gateway": gateway}
+
+
 
 @app.get("/api/integrations/razorpay/test-merchant")
 def razorpay_test_connection_for_merchant(merchant: sqlite3.Row = Depends(lambda authorization=Header(default=None): merchant_from_token(authorization))):

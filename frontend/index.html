@@ -294,6 +294,33 @@ table{border-collapse:collapse}th{padding:13px 16px;color:#8f95ae;font-size:10px
       </div>
 
       <div class="panel space-y-5">
+        <div class="panel-head">
+          <div>
+            <h2>Active payment gateway</h2>
+            <p>Choose which payment gateway Revive uses for recovery payment links.</p>
+          </div>
+          <span id="activeGatewayStatus" class="status-pill">PayU</span>
+        </div>
+
+        <div class="form-grid">
+          <label>
+            Active Gateway
+            <select id="activeGateway">
+              <option value="payu">PayU</option>
+              <option value="razorpay">Razorpay</option>
+            </select>
+          </label>
+        </div>
+
+        <div class="button-row">
+          <button id="saveActiveGatewayBtn" class="primary-btn">Save & Activate</button>
+        </div>
+
+        <div id="activeGatewayResult" class="source-result"></div>
+      </div>
+
+
+      <div class="panel space-y-5">
         <div class="panel-head"><div><h2>Razorpay (optional)</h2><p>Existing adapter retained as a secondary gateway.</p></div><span id="merchantRazorpayStatus" class="status-pill">Optional</span></div>
         <div class="form-grid">
           <label>Mode<select id="rzpMode"><option value="test">Test Mode</option><option value="live">Live Mode</option></select></label>
