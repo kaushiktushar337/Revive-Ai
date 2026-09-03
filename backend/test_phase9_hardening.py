@@ -56,3 +56,50 @@ def test_event_keeps_gateway_when_merchant_switches(monkeypatch):
     assert r.status_code == 200
     conn=main.db(); row=conn.execute('SELECT payment_gateway FROM events WHERE id=?',(eid,)).fetchone(); conn.close()
     assert row['payment_gateway'] == 'payu'
+
+
+def test_simulation_creates_a_small_calculated_batch():
+    client, headers = setup_client()
+    response = client.post('/api/simulate-leaks', headers=headers, json={'count': 3})
+    assert response.status_code == 200
+    created = response.json()['created']
+    assert len(created) == 3
+    assert all(item['amount'] > 0 and 0 <= item['risk_score'] <= 100 for item in created)
+    dashboard = client.get('/api/dashboard', headers=headers).json()
+    assert len(dashboard['events']) >= 3
+    assert len(dashboard['metrics']) > 0
+
+def test_customer_history_derives_revenue_risk_from_unpaid_overdue_bill():
+    client, headers = setup_client()
+    response = client.post('/api/customers/history', headers=headers, json={
+        'name': 'History Customer', 'email': 'history@example.com',
+        'segment': 'SaaS',
+        'bills': [
+            {'invoice_id': 'HIST-1', 'amount': 1000, 'due_date': '2026-08-01', 'paid_date': '2026-08-02', 'status': 'paid', 'payment_method': 'UPI'},
+            {'invoice_id': 'HIST-2', 'amount': 2500, 'due_date': '2026-08-20', 'status': 'unpaid'},
+        ]
+    })
+    assert response.status_code == 200
+    history = client.get(f"/api/customers/{response.json()['customer_id']}/history", headers=headers)
+    assert history.status_code == 200
+    assert len(history.json()['bills']) == 2
+    scan = client.post('/api/customers/scan', headers=headers)
+    assert scan.status_code == 200
+    assert scan.json()['count'] == 1
+    assert scan.json()['created'][0]['amount'] == 2500
+
+
+def test_customer_history_is_merchant_isolated():
+    tmp = Path(tempfile.mkdtemp()) / 'revive.db'
+    main.DB = tmp
+    main.SEED = tmp.parent / 'none.json'
+    main.init_db()
+    client = TestClient(main.app)
+    ra = client.post('/api/auth/register', json={'business_name':'Shop A','login_email':'a-unique@example.com','password':'password123','sender_email':'a@x.com','use_demo_email':True})
+    rb = client.post('/api/auth/register', json={'business_name':'Shop B','login_email':'b-unique@example.com','password':'password123','sender_email':'b@x.com','use_demo_email':True})
+    assert ra.status_code == 200 and rb.status_code == 200
+    a=ra.json(); b=rb.json()
+    ha={'Authorization':f"Bearer {a['token']}"}; hb={'Authorization':f"Bearer {b['token']}"}
+    ca=client.post('/api/customers/history',headers=ha,json={'name':'Alice','email':'alice@x.com','bills':[{'invoice_id':'A-1','amount':1000,'due_date':'2026-08-01','status':'unpaid'}]}).json()
+    assert client.get('/api/customers',headers=hb).json()['customers'] == []
+    assert client.get(f"/api/customers/{ca['customer_id']}/history",headers=hb).status_code == 404

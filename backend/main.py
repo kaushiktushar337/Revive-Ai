@@ -4,8 +4,17 @@ import csv
 import hashlib
 import io
 import json
+import random
 import sqlite3
+import os
 import uuid
+
+try:
+    import psycopg
+    from psycopg.rows import dict_row
+except ImportError:
+    psycopg = None
+    dict_row = None
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -25,6 +34,26 @@ from auth import hash_password, issue_token, verify_password, verify_token
 BASE = Path(__file__).resolve().parent
 DB = BASE / "revive.db"
 SEED = BASE / "seed_events.json"
+DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
+
+class PostgresConnection:
+    def __init__(self, url: str):
+        if psycopg is None:
+            raise RuntimeError("psycopg is required when DATABASE_URL is configured")
+        self.raw = psycopg.connect(url, row_factory=dict_row)
+    def execute(self, sql, params=()):
+        # The existing app uses SQLite-style ? placeholders. Normalize them for psycopg.
+        if "?" in sql:
+            sql = sql.replace("?", "%s")
+        # Translate the few SQLite-only upsert forms used by the prototype.
+        sql = sql.replace("INSERT OR IGNORE INTO", "INSERT INTO")
+        if "INSERT INTO" in sql and "ON CONFLICT" not in sql and params is not None:
+            # caller-specific upserts have been normalized below; leave ordinary inserts alone.
+            pass
+        return self.raw.execute(sql, params)
+    def commit(self): self.raw.commit()
+    def close(self): self.raw.close()
+
 
 app = FastAPI(title="Revive API", version="0.3.0", description="AI revenue recovery prototype API")
 app.add_middleware(
@@ -110,6 +139,10 @@ class EventIn(BaseModel):
     consent_to_email: bool = False
 
 
+class SimulateLeaksIn(BaseModel):
+    count: int = Field(default=2, ge=1, le=3)
+
+
 class CheckoutEventIn(BaseModel):
     session_id: str = Field(min_length=3)
     customer: str = Field(min_length=1)
@@ -117,15 +150,45 @@ class CheckoutEventIn(BaseModel):
     currency: str = "INR"
     stage: str = Field(pattern="^(started|completed)$")
 
+class CustomerBillIn(BaseModel):
+    invoice_id: str | None = None
+    amount: float = Field(gt=0)
+    currency: str = "INR"
+    due_date: str
+    paid_date: str | None = None
+    status: str = Field(default="unpaid", pattern="^(paid|unpaid|partial)$")
+    payment_method: str | None = None
+    notes: str | None = None
+
+class CustomerHistoryIn(BaseModel):
+    customer_id: str | None = None
+    name: str = Field(min_length=1, max_length=120)
+    email: str | None = None
+    phone: str | None = None
+    external_id: str | None = None
+    segment: str | None = None
+    bills: list[CustomerBillIn] = Field(default_factory=list, max_length=100)
+
+class DemoHistoryIn(BaseModel):
+    customers: int = Field(default=6, ge=1, le=30)
+    bills_per_customer: int = Field(default=8, ge=3, le=24)
+
 
 def db():
+    if DATABASE_URL:
+        return PostgresConnection(DATABASE_URL)
     conn = sqlite3.connect(DB)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys = ON")
     return conn
 
 
-def ensure_column(conn: sqlite3.Connection, table: str, column: str, ddl: str):
+def ensure_column(conn, table: str, column: str, ddl: str):
+    if DATABASE_URL:
+        row = conn.execute("SELECT 1 FROM information_schema.columns WHERE table_name=? AND column_name=?", (table, column)).fetchone()
+        if not row:
+            conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {ddl}")
+        return
     cols = {r[1] for r in conn.execute(f"PRAGMA table_info({table})").fetchall()}
     if column not in cols:
         conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {ddl}")
@@ -157,6 +220,44 @@ def init_db():
             payu_mode TEXT DEFAULT 'test',
             active INTEGER NOT NULL DEFAULT 1,
             created_at TEXT NOT NULL
+        )""")
+    conn.execute("""CREATE TABLE IF NOT EXISTS users (
+            id TEXT PRIMARY KEY,
+            merchant_id TEXT NOT NULL,
+            email TEXT UNIQUE NOT NULL,
+            role TEXT NOT NULL DEFAULT 'owner',
+            created_at TEXT NOT NULL,
+            active INTEGER NOT NULL DEFAULT 1
+        )""")
+    conn.execute("""CREATE TABLE IF NOT EXISTS customers (
+            id TEXT PRIMARY KEY,
+            merchant_id TEXT NOT NULL,
+            name TEXT NOT NULL,
+            email TEXT,
+            phone TEXT,
+            external_id TEXT,
+            segment TEXT,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            UNIQUE(merchant_id, email)
+        )""")
+    conn.execute("""CREATE TABLE IF NOT EXISTS customer_bills (
+            id TEXT PRIMARY KEY,
+            merchant_id TEXT NOT NULL,
+            customer_id TEXT NOT NULL,
+            invoice_id TEXT,
+            amount REAL NOT NULL,
+            currency TEXT NOT NULL DEFAULT 'INR',
+            due_date TEXT NOT NULL,
+            paid_date TEXT,
+            status TEXT NOT NULL DEFAULT 'unpaid',
+            payment_method TEXT,
+            source TEXT NOT NULL DEFAULT 'manual',
+            notes TEXT,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            FOREIGN KEY(customer_id) REFERENCES customers(id) ON DELETE CASCADE,
+            UNIQUE(merchant_id, invoice_id)
         )""")
     conn.execute(
         """CREATE TABLE IF NOT EXISTS events (
@@ -197,7 +298,11 @@ def init_db():
     ensure_column(conn, "events", "recovered_amount", "REAL")
     ensure_column(conn, "events", "outcome_source", "TEXT")
     ensure_column(conn, "events", "payment_gateway", "TEXT")
+    ensure_column(conn, "events", "customer_id", "TEXT")
+    ensure_column(conn, "events", "bill_id", "TEXT")
     conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_events_external_id ON events(external_id) WHERE external_id IS NOT NULL")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_customer_bills_merchant_due ON customer_bills(merchant_id, due_date)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_customers_merchant ON customers(merchant_id)")
     ensure_column(conn, "events", "customer_email", "TEXT")
     ensure_column(conn, "events", "consent_to_email", "INTEGER DEFAULT 0")
     ensure_column(conn, "merchants", "razorpay_key_id", "TEXT")
@@ -255,7 +360,14 @@ def init_db():
         now = datetime.now(timezone.utc).isoformat()
         conn.execute("INSERT INTO merchants(id,business_name,login_email,password_hash,sender_email,use_demo_email,active,created_at) VALUES(?,?,?,?,?,?,?,?)", ("m_demo", "Revive Demo Merchant", "demo@revive.local", hash_password("demo12345"), "demo@revive.local", 1, 1, now))
     conn.execute("UPDATE events SET merchant_id='m_demo' WHERE merchant_id IS NULL")
+    demo_user = conn.execute("SELECT id FROM users WHERE email=?", ("demo@revive.local",)).fetchone()
+    if not demo_user:
+        conn.execute("INSERT INTO users(id,merchant_id,email,role,created_at,active) VALUES(?,?,?,?,?,?)", ("u_demo", "m_demo", "demo@revive.local", "owner", now, 1))
     conn.execute("UPDATE checkout_sessions SET merchant_id='m_demo' WHERE merchant_id IS NULL")
+    merchants = conn.execute("SELECT id, login_email, created_at FROM merchants WHERE active=1").fetchall()
+    for m in merchants:
+        if not conn.execute("SELECT id FROM users WHERE email=?", (m["login_email"],)).fetchone():
+            conn.execute("INSERT INTO users(id,merchant_id,email,role,created_at,active) VALUES(?,?,?,?,?,?)", (f"u_{uuid.uuid4().hex[:10]}", m["id"], m["login_email"], "owner", m["created_at"], 1))
     conn.commit()
     conn.close()
 
@@ -280,9 +392,16 @@ def insert_event(event: dict[str, Any], decision, merchant_id: str = "m_demo"):
     now = datetime.now(timezone.utc).isoformat()
     conn = db()
     conn.execute(
-        """INSERT OR REPLACE INTO events
+        """INSERT INTO events
         (id,merchant_id,event_type,customer,amount,currency,status,recovery_probability,risk_score,recommended_action,action_reason,risk_reason,delay_hours,created_at,action_status,recovered,external_id,source,action_reference,action_payload,lifecycle_status,recovery_link_id,recovery_link_url,recovery_expires_at,recovered_at,recovered_amount,outcome_source,payment_gateway,customer_email,consent_to_email)
-        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+        ON CONFLICT(id) DO UPDATE SET
+        merchant_id=excluded.merchant_id,event_type=excluded.event_type,customer=excluded.customer,amount=excluded.amount,currency=excluded.currency,status=excluded.status,
+        recovery_probability=excluded.recovery_probability,risk_score=excluded.risk_score,recommended_action=excluded.recommended_action,action_reason=excluded.action_reason,
+        risk_reason=excluded.risk_reason,delay_hours=excluded.delay_hours,created_at=excluded.created_at,action_status=excluded.action_status,recovered=excluded.recovered,
+        external_id=excluded.external_id,source=excluded.source,action_reference=excluded.action_reference,action_payload=excluded.action_payload,lifecycle_status=excluded.lifecycle_status,
+        recovery_link_id=excluded.recovery_link_id,recovery_link_url=excluded.recovery_link_url,recovery_expires_at=excluded.recovery_expires_at,recovered_at=excluded.recovered_at,
+        recovered_amount=excluded.recovered_amount,outcome_source=excluded.outcome_source,payment_gateway=excluded.payment_gateway,customer_email=excluded.customer_email,consent_to_email=excluded.consent_to_email""",
         (
             event_id,
             merchant_id,
@@ -316,6 +435,8 @@ def insert_event(event: dict[str, Any], decision, merchant_id: str = "m_demo"):
             1 if event.get("consent_to_email") else 0,
         ),
     )
+    if event.get("customer_id") or event.get("bill_id"):
+        conn.execute("UPDATE events SET customer_id=?, bill_id=? WHERE id=?", (event.get("customer_id"), event.get("bill_id"), event_id))
     conn.commit()
     conn.close()
     conn = db()
@@ -397,6 +518,7 @@ def register_merchant(payload: MerchantSignupIn):
     merchant_id = f"m_{uuid.uuid4().hex[:10]}"
     now = datetime.now(timezone.utc).isoformat()
     conn.execute("INSERT INTO merchants(id,business_name,login_email,password_hash,sender_email,use_demo_email,smtp_host,smtp_port,smtp_username,smtp_password,active,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)", (merchant_id,payload.business_name.strip(),email,hash_password(payload.password),sender,1 if payload.use_demo_email else 0,payload.smtp_host,payload.smtp_port,payload.smtp_username,payload.smtp_password,1,now))
+    conn.execute("INSERT INTO users(id,merchant_id,email,role,created_at,active) VALUES(?,?,?,?,?,?)", (f"u_{uuid.uuid4().hex[:10]}", merchant_id, email, "owner", now, 1))
     conn.commit(); conn.close()
     token = issue_token(merchant_id)
     return {"ok": True, "token": token, "merchant": {"id": merchant_id, "business_name": payload.business_name.strip(), "login_email": email, "sender_email": sender, "use_demo_email": payload.use_demo_email}}
@@ -569,6 +691,10 @@ def test_email_delivery(payload: EmailTestIn, merchant: sqlite3.Row = Depends(la
         "message": "Test email sent in demo mode." if result.get("mocked") else "Test email sent successfully.",
     }
 
+@app.get("/")
+def root():
+    return {"service": "revive-api", "status": "online"}
+
 @app.get("/api/health")
 def health():
     return {
@@ -588,12 +714,15 @@ def razorpay_test_connection():
 def dashboard(merchant: sqlite3.Row = Depends(lambda authorization=Header(default=None): merchant_from_token(authorization))):
     conn = db()
     rows = conn.execute("SELECT * FROM events WHERE merchant_id=? ORDER BY created_at DESC", (merchant["id"],)).fetchall()
-    conn.close()
     items = [dict(r) for r in rows]
     at_risk = sum(r["amount"] for r in items if not r["recovered"] and r["action_status"] not in {"recovered"})
     recovered = sum(r["amount"] for r in items if r["recovered"])
     expected = sum(r["amount"] * r["recovery_probability"] for r in items if not r["recovered"])
     active = sum(1 for r in items if r["action_status"] in {"pending", "recommended"})
+    customer_count = conn.execute("SELECT COUNT(*) AS c FROM customers WHERE merchant_id=?", (merchant["id"],)).fetchone()["c"]
+    today = datetime.now(timezone.utc).date().isoformat()
+    overdue_customer_count = conn.execute("SELECT COUNT(DISTINCT customer_id) AS c FROM customer_bills WHERE merchant_id=? AND status IN ('unpaid','partial') AND due_date < ?", (merchant["id"], today)).fetchone()["c"]
+    conn.close()
     return {
         "metrics": {
             "revenue_at_risk": round(at_risk, 2),
@@ -602,6 +731,8 @@ def dashboard(merchant: sqlite3.Row = Depends(lambda authorization=Header(defaul
             "events": len(items),
             "active_actions": active,
             "recoverable_events": sum(1 for r in items if r["recommended_action"] != "do_nothing" and not r["recovered"]),
+            "customers": customer_count,
+            "overdue_customers": overdue_customer_count,
         },
         "events": items,
     }
@@ -630,6 +761,19 @@ def create_event(event: EventIn, merchant: sqlite3.Row = Depends(lambda authoriz
     decision = hydrate(payload)
     event_id = insert_event(payload, decision, merchant["id"])
     return {"id": event_id, "deduplicated": False, **payload, **decision.__dict__}
+
+
+@app.post("/api/simulate-leaks")
+def simulate_leaks(payload: SimulateLeaksIn, merchant: sqlite3.Row = Depends(lambda authorization=Header(default=None): merchant_from_token(authorization))):
+    """Backward-compatible demo trigger: generate complete customer histories, then scan them."""
+    result = generate_demo_history(DemoHistoryIn(customers=payload.count, bills_per_customer=8), merchant)
+    created = result.get("scan", {}).get("created", [])[:payload.count]
+    return {
+        "created": created,
+        "customers": result.get("customers", []),
+        "scan": result.get("scan", {}),
+        "message": "Customer histories generated and scanned for derived revenue leaks."
+    }
 
 
 @app.post("/api/events/{event_id}/execute")
@@ -746,7 +890,7 @@ def process_razorpay_payload(payload: dict[str, Any], merchant_id: str):
     if existing:
         conn.close()
         return {"ok": True, "deduplicated": True, "event": event_name}
-    conn.execute("INSERT OR IGNORE INTO webhook_events(id,source,event_name,external_id,received_at,payload) VALUES(?,?,?,?,?,?)", (webhook_external_id, "razorpay", event_name, webhook_external_id, datetime.now(timezone.utc).isoformat(), json.dumps(payload)))
+    conn.execute("INSERT INTO webhook_events(id,source,event_name,external_id,received_at,payload) VALUES(?,?,?,?,?,?) ON CONFLICT DO NOTHING", (webhook_external_id, "razorpay", event_name, webhook_external_id, datetime.now(timezone.utc).isoformat(), json.dumps(payload)))
     conn.commit(); conn.close()
 
     if not internal or internal.get("amount", 0) <= 0:
@@ -861,13 +1005,130 @@ async def razorpay_merchant_webhook(merchant_id: str, request: Request, x_razorp
     return process_razorpay_payload(payload, merchant_id)
 
 
+
+@app.get("/api/customers")
+def list_customers(merchant: sqlite3.Row = Depends(lambda authorization=Header(default=None): merchant_from_token(authorization))):
+    conn = db()
+    rows = conn.execute("""
+        SELECT c.*, COUNT(b.id) AS bill_count,
+               COALESCE(SUM(b.amount),0) AS billed_amount,
+               COALESCE(SUM(CASE WHEN b.status='paid' THEN b.amount ELSE 0 END),0) AS paid_amount,
+               COALESCE(SUM(CASE WHEN b.status IN ('unpaid','partial') AND b.due_date < ? THEN b.amount ELSE 0 END),0) AS overdue_amount,
+               MAX(b.paid_date) AS last_paid_date
+        FROM customers c LEFT JOIN customer_bills b ON b.customer_id=c.id AND b.merchant_id=c.merchant_id
+        WHERE c.merchant_id=? GROUP BY c.id ORDER BY c.updated_at DESC
+    """, (datetime.now(timezone.utc).date().isoformat(), merchant["id"])).fetchall()
+    conn.close()
+    out=[]
+    for r in rows:
+        d=dict(r)
+        total=int(d.get("bill_count") or 0); paid=sum(1 for _ in [])
+        d["payment_success_rate"] = round((float(d.get("paid_amount") or 0) / float(d.get("billed_amount") or 1)), 3)
+        out.append(d)
+    return {"customers": out}
+
+@app.get("/api/customers/{customer_id}/history")
+def customer_history(customer_id: str, merchant: sqlite3.Row = Depends(lambda authorization=Header(default=None): merchant_from_token(authorization))):
+    conn=db()
+    customer=conn.execute("SELECT * FROM customers WHERE id=? AND merchant_id=?", (customer_id,merchant["id"])).fetchone()
+    if not customer: conn.close(); raise HTTPException(status_code=404, detail="Customer not found")
+    bills=conn.execute("SELECT * FROM customer_bills WHERE customer_id=? AND merchant_id=? ORDER BY due_date DESC", (customer_id,merchant["id"])).fetchall()
+    conn.close()
+    return {"customer":dict(customer),"bills":[dict(b) for b in bills]}
+
+@app.post("/api/customers/history")
+def upsert_customer_history(payload: CustomerHistoryIn, merchant: sqlite3.Row = Depends(lambda authorization=Header(default=None): merchant_from_token(authorization))):
+    now=datetime.now(timezone.utc).isoformat()
+    conn=db()
+    customer_id=payload.customer_id
+    existing=None
+    if customer_id:
+        existing=conn.execute("SELECT id FROM customers WHERE id=? AND merchant_id=?",(customer_id,merchant["id"])).fetchone()
+    if not existing and payload.email:
+        existing=conn.execute("SELECT id FROM customers WHERE merchant_id=? AND email=?",(merchant["id"],payload.email.strip().lower())).fetchone()
+    if existing:
+        customer_id=existing["id"]
+        conn.execute("UPDATE customers SET name=?,email=?,phone=?,external_id=?,segment=?,updated_at=? WHERE id=? AND merchant_id=?",(payload.name.strip(),(payload.email or "").strip().lower() or None,payload.phone,payload.external_id,payload.segment,now,customer_id,merchant["id"]))
+    else:
+        customer_id=customer_id or f"cus_{uuid.uuid4().hex[:10]}"
+        conn.execute("INSERT INTO customers(id,merchant_id,name,email,phone,external_id,segment,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?)",(customer_id,merchant["id"],payload.name.strip(),(payload.email or "").strip().lower() or None,payload.phone,payload.external_id,payload.segment,now,now))
+    added=0; updated=0
+    for bill in payload.bills:
+        invoice_id=bill.invoice_id or f"INV-{uuid.uuid4().hex[:8].upper()}"
+        status=bill.status
+        if bill.paid_date and status == "unpaid": status="paid"
+        existing_bill=conn.execute("SELECT id FROM customer_bills WHERE merchant_id=? AND invoice_id=?",(merchant["id"],invoice_id)).fetchone()
+        if existing_bill:
+            conn.execute("UPDATE customer_bills SET customer_id=?,amount=?,currency=?,due_date=?,paid_date=?,status=?,payment_method=?,notes=?,updated_at=? WHERE id=?",(customer_id,bill.amount,bill.currency,bill.due_date,bill.paid_date,status,bill.payment_method,bill.notes,now,existing_bill["id"]))
+            updated+=1
+        else:
+            conn.execute("INSERT INTO customer_bills(id,merchant_id,customer_id,invoice_id,amount,currency,due_date,paid_date,status,payment_method,source,notes,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)",(f"bill_{uuid.uuid4().hex[:10]}",merchant["id"],customer_id,invoice_id,bill.amount,bill.currency,bill.due_date,bill.paid_date,status,bill.payment_method,"manual",bill.notes,now,now))
+            added+=1
+    conn.commit(); conn.close()
+    audit(None,"customer_history_saved","saved",f"Saved history for {payload.name}: {added} new bill(s), {updated} updated bill(s).",merchant["id"])
+    return {"ok":True,"customer_id":customer_id,"added_bills":added,"updated_bills":updated}
+
+@app.post("/api/customers/demo")
+def generate_demo_history(payload: DemoHistoryIn, merchant: sqlite3.Row = Depends(lambda authorization=Header(default=None): merchant_from_token(authorization))):
+    rng=random.Random(42+payload.customers+payload.bills_per_customer)
+    names=["Aarav Mehta","Isha Sharma","Vihaan Kapoor","Anaya Rao","Kabir Singh","Mira Nair","Rohan Gupta","Sneha Iyer","Aditya Verma","Meera Shah","Karan Malhotra","Nisha Joshi","Arjun Bhat","Tanya Mehta","Dev Patel","Pooja Nair","Aman Sethi","Riya Kapoor","Yash Jain","Simran Kaur","Vikram Rao","Aditi Shah","Nikhil Gupta","Anjali Verma","Sahil Khan","Kritika Roy","Manav Iyer","Diya Singh","Harsh Bansal","Rhea Mehta"]
+    today=datetime.now(timezone.utc).date(); created=[]
+    conn=db()
+    for i in range(payload.customers):
+        name=names[i%len(names)]; email=f"{name.lower().replace(' ','_')}@demo.revive.local"; now=datetime.now(timezone.utc).isoformat(); cid=f"cus_demo_{uuid.uuid4().hex[:8]}"
+        conn.execute("INSERT INTO customers(id,merchant_id,name,email,phone,external_id,segment,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?)",(cid,merchant["id"],name,email,f"9{rng.randint(100000000,999999999)}","demo-"+cid,rng.choice(["D2C","SaaS","B2B services","Retail"]),now,now))
+        for j in range(payload.bills_per_customer):
+            due=today - __import__('datetime').timedelta(days=(payload.bills_per_customer-j)*30 + rng.randint(-5,8))
+            amount=float(rng.choice([1200,2500,5000,7500,12000,18500,25000,45000]))
+            r=rng.random()
+            if j < payload.bills_per_customer-2 and r < 0.72:
+                late=rng.randint(-2,12); paid=due+__import__('datetime').timedelta(days=max(0,late)); status="paid"
+                if paid>today: paid=None; status="unpaid"
+            else:
+                paid=None; status="unpaid"
+            if paid is not None and paid>today: paid=None; status="unpaid"
+            invoice=f"DEMO-{cid[-5:].upper()}-{j+1:02d}"
+            conn.execute("INSERT INTO customer_bills(id,merchant_id,customer_id,invoice_id,amount,currency,due_date,paid_date,status,payment_method,source,notes,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)",(f"bill_{uuid.uuid4().hex[:10]}",merchant["id"],cid,invoice,amount,"INR",due.isoformat(),paid.isoformat() if paid else None,status,"UPI" if status=="paid" else None,"demo",None,now,now))
+        created.append({"customer_id":cid,"customer":name})
+    conn.commit(); conn.close()
+    audit(None,"customer_history_demo","created",f"Generated {len(created)} demo customer histories.",merchant["id"])
+    scan=scan_customer_histories(merchant)
+    return {"ok":True,"customers":created,"scan":scan}
+
+@app.post("/api/customers/scan")
+def scan_customer_histories(merchant: sqlite3.Row = Depends(lambda authorization=Header(default=None): merchant_from_token(authorization))):
+    today=datetime.now(timezone.utc).date()
+    conn=db()
+    rows=conn.execute("""
+      SELECT b.*, c.name AS customer_name, c.email AS customer_email,
+             (SELECT COUNT(*) FROM customer_bills pb WHERE pb.customer_id=b.customer_id AND pb.merchant_id=b.merchant_id) AS bill_count,
+             (SELECT COUNT(*) FROM customer_bills pb WHERE pb.customer_id=b.customer_id AND pb.merchant_id=b.merchant_id AND pb.status='paid') AS paid_count,
+             (SELECT MAX(pb.paid_date) FROM customer_bills pb WHERE pb.customer_id=b.customer_id AND pb.merchant_id=b.merchant_id AND pb.status='paid') AS last_paid_date,
+             (SELECT COALESCE(SUM(pb.amount),0) FROM customer_bills pb WHERE pb.customer_id=b.customer_id AND pb.merchant_id=b.merchant_id) AS customer_value
+      FROM customer_bills b JOIN customers c ON c.id=b.customer_id
+      WHERE b.merchant_id=? AND b.status IN ('unpaid','partial') AND b.due_date < ?
+      ORDER BY b.due_date ASC
+    """,(merchant["id"],today.isoformat())).fetchall(); conn.close()
+    created=[]
+    for row in rows:
+        external=f"history:{row['id']}"
+        conn=db(); existing=conn.execute("SELECT id FROM events WHERE merchant_id=? AND external_id=?",(merchant["id"],external)).fetchone(); conn.close()
+        if existing: continue
+        due=datetime.fromisoformat(row["due_date"]).date(); days=(today-due).days
+        success=float(row["paid_count"] or 0)/float(row["bill_count"] or 1)
+        last_paid=row["last_paid_date"]; days_since=90 if not last_paid else max(0,(today-datetime.fromisoformat(last_paid).date()).days)
+        event={"event_type":"invoice_overdue","customer":row["customer_name"],"customer_email":row["customer_email"],"amount":row["amount"],"currency":row["currency"],"external_id":external,"source":"customer_history_scanner","days_overdue":days,"previous_success_rate":success,"days_since_last_success":days_since,"prior_contacts":0,"customer_value":row["customer_value"] or row["amount"],"event_age_hours":days*24,"consent_to_email":bool(row["customer_email"]),"payment_gateway":merchant["payment_gateway"] or "payu","customer_id":row["customer_id"],"bill_id":row["id"]}
+        decision=hydrate(event); eid=insert_event(event,decision,merchant["id"]); created.append({"id":eid,"customer":row["customer_name"],"amount":row["amount"],"days_overdue":days,"risk_score":decision.risk_score,"recommended_action":decision.recommended_action,"recovery_probability":decision.recovery_probability})
+    audit(None,"customer_history_scan","scanned",f"Scanned customer histories and created {len(created)} new leak event(s).",merchant["id"])
+    return {"ok":True,"count":len(created),"created":created}
+
 @app.post("/api/checkout/events")
 def checkout_event(event: CheckoutEventIn, merchant: sqlite3.Row = Depends(lambda authorization=Header(default=None): merchant_from_token(authorization))):
     conn = db()
     now = datetime.now(timezone.utc).isoformat()
     if event.stage == "started":
         conn.execute(
-            "INSERT OR REPLACE INTO checkout_sessions(session_id,merchant_id,customer,amount,currency,started_at,completed_at,event_id) VALUES(?,?,?,?,?,?,?)",
+            "INSERT INTO checkout_sessions(session_id,merchant_id,customer,amount,currency,started_at,completed_at,event_id) VALUES(?,?,?,?,?,?,?,?) ON CONFLICT(session_id) DO UPDATE SET merchant_id=excluded.merchant_id, customer=excluded.customer, amount=excluded.amount, currency=excluded.currency, started_at=excluded.started_at, completed_at=excluded.completed_at, event_id=excluded.event_id",
             (event.session_id, merchant["id"], event.customer, event.amount, event.currency, now, None, None),
         )
         conn.commit()
@@ -926,38 +1187,44 @@ async def import_invoices(file: UploadFile = File(...), merchant: sqlite3.Row = 
         raise HTTPException(status_code=400, detail=f"CSV must contain: {', '.join(sorted(required))}")
 
     today = datetime.now(timezone.utc).date()
-    created = []
+    touched = 0
+    bills_added = 0
+    conn = db()
     for row in reader:
         try:
-            due_date = datetime.fromisoformat(row["due_date"]).date()
-            days_overdue = max(0, (today - due_date).days)
+            due = datetime.fromisoformat(row["due_date"]).date()
             amount = float(row["amount"])
         except (ValueError, TypeError) as exc:
             raise HTTPException(status_code=400, detail=f"Invalid invoice row: {row}") from exc
-        if days_overdue <= 0:
-            continue
-        event = {
-            "event_type": "invoice_overdue",
-            "customer": row["customer"],
-            "amount": amount,
-            "currency": row.get("currency") or "INR",
-            "external_id": row.get("invoice_id") or hashlib.sha256(f"{row['customer']}|{row['amount']}|{row['due_date']}".encode()).hexdigest()[:32],
-            "source": "invoice_csv",
-            "days_overdue": days_overdue,
-            "previous_success_rate": float(row.get("previous_success_rate") or 0.72),
-            "customer_value": float(row.get("customer_value") or amount * 4),
-            "prior_contacts": int(row.get("prior_contacts") or 0),
-            "days_since_last_success": int(row.get("days_since_last_success") or 10),
-            "event_age_hours": days_overdue * 24,
-        }
-        conn = db()
-        existing = conn.execute("SELECT id FROM events WHERE external_id=?", (event["external_id"],)).fetchone()
-        conn.close()
+        name = (row.get("customer") or "Unknown customer").strip()
+        email = (row.get("customer_email") or row.get("email") or "").strip().lower() or None
+        customer_id = None
+        if email:
+            cr = conn.execute("SELECT id FROM customers WHERE merchant_id=? AND email=?", (merchant["id"], email)).fetchone()
+            customer_id = cr["id"] if cr else None
+        if not customer_id:
+            cr = conn.execute("SELECT id FROM customers WHERE merchant_id=? AND name=?", (merchant["id"], name)).fetchone()
+            customer_id = cr["id"] if cr else None
+        now = datetime.now(timezone.utc).isoformat()
+        if not customer_id:
+            customer_id = f"cus_{uuid.uuid4().hex[:10]}"
+            conn.execute("INSERT INTO customers(id,merchant_id,name,email,phone,external_id,segment,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?)", (customer_id,merchant["id"],name,email,row.get("customer_phone") or row.get("phone"),None,None,now,now))
+            touched += 1
+        else:
+            conn.execute("UPDATE customers SET email=COALESCE(?,email), updated_at=? WHERE id=? AND merchant_id=?", (email,now,customer_id,merchant["id"]))
+        invoice_id = (row.get("invoice_id") or row.get("InvoiceID") or f"INV-{uuid.uuid4().hex[:8].upper()}").strip()
+        existing = conn.execute("SELECT id FROM customer_bills WHERE merchant_id=? AND invoice_id=?", (merchant["id"], invoice_id)).fetchone()
+        paid_date = (row.get("paid_date") or row.get("paid_on") or "").strip() or None
+        status = (row.get("status") or ("paid" if paid_date else "unpaid")).strip().lower()
+        if status not in {"paid","unpaid","partial"}: status="paid" if paid_date else "unpaid"
         if existing:
-            continue
-        decision = hydrate(event)
-        created.append(insert_event(event, decision, merchant["id"]))
-    return {"created": created, "count": len(created)}
+            conn.execute("UPDATE customer_bills SET customer_id=?,amount=?,currency=?,due_date=?,paid_date=?,status=?,payment_method=?,source=?,updated_at=? WHERE id=?", (customer_id,amount,row.get("currency") or "INR",due.isoformat(),paid_date,status,row.get("payment_method"),"invoice_csv",now,existing["id"]))
+        else:
+            conn.execute("INSERT INTO customer_bills(id,merchant_id,customer_id,invoice_id,amount,currency,due_date,paid_date,status,payment_method,source,notes,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)", (f"bill_{uuid.uuid4().hex[:10]}",merchant["id"],customer_id,invoice_id,amount,row.get("currency") or "INR",due.isoformat(),paid_date,status,row.get("payment_method"),"invoice_csv",None,now,now))
+            bills_added += 1
+    conn.commit(); conn.close()
+    scan = scan_customer_histories(merchant)
+    return {"ok": True, "customers_touched": touched, "bills_added": bills_added, "count": scan.get("count", 0), "created": scan.get("created", []), "message": "Imported bills into customer histories and scanned for revenue risk."}
 
 
 class RecoveryEmailIn(BaseModel):
@@ -1026,6 +1293,8 @@ def reset_demo(merchant: sqlite3.Row = Depends(lambda authorization=Header(defau
     conn.execute("DELETE FROM audit_logs WHERE merchant_id=?", (merchant["id"],))
     conn.execute("DELETE FROM events WHERE merchant_id=?", (merchant["id"],))
     conn.execute("DELETE FROM checkout_sessions WHERE merchant_id=?", (merchant["id"],))
+    conn.execute("DELETE FROM customer_bills WHERE merchant_id=?", (merchant["id"],))
+    conn.execute("DELETE FROM customers WHERE merchant_id=?", (merchant["id"],))
     conn.commit()
     conn.close()
     events = json.loads(SEED.read_text(encoding="utf-8"))

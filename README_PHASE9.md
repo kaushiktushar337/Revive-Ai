@@ -42,3 +42,17 @@ Backend test suite: 16 passed.
 FastAPI smoke test: `/api/health` returned HTTP 200.
 
 The environment used for packaging did not have the Vite dependency cache, so a local `npm install` was not completed here. On Windows, Node 20–22 is recommended for this Vite configuration.
+
+
+## Customer history + database update
+The current build supports customer histories and an optional hosted PostgreSQL database. Set DATABASE_URL to a PostgreSQL connection string for deployed persistence; when DATABASE_URL is absent, the app falls back to local SQLite. Customer records and bills are stored separately from the derived recovery events. Use POST /api/customers/history for manual history entry, POST /api/customers/demo for demo history generation, and POST /api/customers/scan to derive new overdue revenue-risk events from the histories.
+
+## Phase 10: customer history + hosted database
+- The **Simulate customer history** control now creates full customer ledgers (multiple bills with due dates, paid dates, and unpaid balances) instead of directly creating fake leak events.
+- Merchants can add customer histories manually from **Customers → Add customer**.
+- **Customers → Scan for leaks** derives current invoice-overdue revenue-risk events from the stored ledger.
+- The legacy `/api/simulate-leaks` route is retained as a backward-compatible demo trigger but now generates customer histories and scans them.
+- Invoice CSV import now writes bills into customer histories before scanning for overdue opportunities.
+- Added `users`, `customers`, and `customer_bills` tables. Each merchant owns its users/customers/bills.
+- The database layer supports local SQLite by default and PostgreSQL/Supabase when `DATABASE_URL` is set. The SQL used for the core schema and event upserts is compatible with both modes.
+- For Render, pin Python with `backend/.python-version` or `PYTHON_VERSION=3.12.7` and set `DATABASE_URL` to the hosted PostgreSQL connection string for persistence.
