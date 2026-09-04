@@ -764,7 +764,7 @@ def razorpay_test_connection():
 @app.get("/api/dashboard")
 def dashboard(merchant: sqlite3.Row = Depends(lambda authorization=Header(default=None): merchant_from_token(authorization))):
     conn = db()
-    rows = conn.execute("SELECT * FROM events WHERE merchant_id=? ORDER BY created_at DESC", (merchant["id"],)).fetchall()
+    rows = conn.execute("SELECT * FROM events WHERE merchant_id=? AND COALESCE(lifecycle_status, '') != 'SUPERSEDED' ORDER BY created_at DESC", (merchant["id"],)).fetchall()
     items = [dict(r) for r in rows]
     at_risk = sum(r["amount"] for r in items if not r["recovered"] and r["action_status"] not in {"recovered"})
     recovered = sum(r["amount"] for r in items if r["recovered"])
@@ -1148,30 +1148,92 @@ def generate_demo_history(payload: DemoHistoryIn, merchant: sqlite3.Row = Depend
 
 @app.post("/api/customers/scan")
 def scan_customer_histories(merchant: sqlite3.Row = Depends(lambda authorization=Header(default=None): merchant_from_token(authorization))):
+    """Re-evaluate every customer from current ledger data and replace prior scanner suggestions.
+
+    The scan is intentionally idempotent against the *current* customer history, not against
+    the old event rows. Previous customer-history suggestions are marked SUPERSEDED and hidden
+    from the dashboard/risk/recovery views. Fresh events are then created from the current bills,
+    so changing a payment status, due date, or customer history immediately changes the model inputs.
+    """
     today=datetime.now(timezone.utc).date()
+    merchant_id=merchant["id"]
     conn=db()
-    rows=conn.execute("""
-      SELECT b.*, c.name AS customer_name, c.email AS customer_email,
-             (SELECT COUNT(*) FROM customer_bills pb WHERE pb.customer_id=b.customer_id AND pb.merchant_id=b.merchant_id) AS bill_count,
-             (SELECT COUNT(*) FROM customer_bills pb WHERE pb.customer_id=b.customer_id AND pb.merchant_id=b.merchant_id AND pb.status='paid') AS paid_count,
-             (SELECT MAX(pb.paid_date) FROM customer_bills pb WHERE pb.customer_id=b.customer_id AND pb.merchant_id=b.merchant_id AND pb.status='paid') AS last_paid_date,
-             (SELECT COALESCE(SUM(pb.amount),0) FROM customer_bills pb WHERE pb.customer_id=b.customer_id AND pb.merchant_id=b.merchant_id) AS customer_value
-      FROM customer_bills b JOIN customers c ON c.id=b.customer_id
-      WHERE b.merchant_id=? AND b.status IN ('unpaid','partial') AND b.due_date < ?
-      ORDER BY b.due_date ASC
-    """,(merchant["id"],today.isoformat())).fetchall(); conn.close()
+
+    # Remove previous scan suggestions from the active UI without destroying the audit trail or
+    # payment-link history. Clear external_id so the same bill can receive a fresh event row.
+    previous = conn.execute(
+        "SELECT COUNT(*) AS c FROM events WHERE merchant_id=? AND source='customer_history_scanner' AND COALESCE(lifecycle_status,'') != 'SUPERSEDED'",
+        (merchant_id,)
+    ).fetchone()["c"]
+    conn.execute(
+        "UPDATE events SET lifecycle_status='SUPERSEDED', action_status='superseded', external_id=NULL WHERE merchant_id=? AND source='customer_history_scanner' AND COALESCE(lifecycle_status,'') != 'SUPERSEDED'",
+        (merchant_id,)
+    )
+
+    # Evaluate every customer in one pass. Customers without overdue bills are still evaluated
+    # and simply produce no leak event.
+    customer_rows=conn.execute(
+        """
+        SELECT c.id AS customer_id, c.name AS customer_name, c.email AS customer_email,
+               COUNT(b.id) AS bill_count,
+               SUM(CASE WHEN b.status='paid' THEN 1 ELSE 0 END) AS paid_count,
+               COALESCE(SUM(b.amount),0) AS customer_value,
+               MAX(CASE WHEN b.status='paid' THEN b.paid_date END) AS last_paid_date
+        FROM customers c
+        LEFT JOIN customer_bills b ON b.customer_id=c.id AND b.merchant_id=c.merchant_id
+        WHERE c.merchant_id=?
+        GROUP BY c.id
+        ORDER BY c.name ASC
+        """,
+        (merchant_id,)
+    ).fetchall()
+
+    overdue_rows=conn.execute(
+        """
+        SELECT b.*, c.name AS customer_name, c.email AS customer_email,
+               (SELECT COUNT(*) FROM customer_bills pb WHERE pb.customer_id=b.customer_id AND pb.merchant_id=b.merchant_id) AS bill_count,
+               (SELECT COUNT(*) FROM customer_bills pb WHERE pb.customer_id=b.customer_id AND pb.merchant_id=b.merchant_id AND pb.status='paid') AS paid_count,
+               (SELECT MAX(pb.paid_date) FROM customer_bills pb WHERE pb.customer_id=b.customer_id AND pb.merchant_id=b.merchant_id AND pb.status='paid') AS last_paid_date,
+               (SELECT COALESCE(SUM(pb.amount),0) FROM customer_bills pb WHERE pb.customer_id=b.customer_id AND pb.merchant_id=b.merchant_id) AS customer_value
+        FROM customer_bills b JOIN customers c ON c.id=b.customer_id
+        WHERE b.merchant_id=? AND b.status IN ('unpaid','partial') AND b.due_date < ?
+        ORDER BY b.due_date ASC
+        """,
+        (merchant_id,today.isoformat())
+    ).fetchall()
+    conn.commit(); conn.close()
+
     created=[]
-    for row in rows:
-        external=f"history:{row['id']}"
-        conn=db(); existing=conn.execute("SELECT id FROM events WHERE merchant_id=? AND external_id=?",(merchant["id"],external)).fetchone(); conn.close()
-        if existing: continue
-        due=datetime.fromisoformat(row["due_date"]).date(); days=(today-due).days
+    for row in overdue_rows:
+        due=datetime.fromisoformat(row["due_date"]).date(); days=max(0,(today-due).days)
         success=float(row["paid_count"] or 0)/float(row["bill_count"] or 1)
-        last_paid=row["last_paid_date"]; days_since=90 if not last_paid else max(0,(today-datetime.fromisoformat(last_paid).date()).days)
-        event={"event_type":"invoice_overdue","customer":row["customer_name"],"customer_email":row["customer_email"],"amount":row["amount"],"currency":row["currency"],"external_id":external,"source":"customer_history_scanner","days_overdue":days,"previous_success_rate":success,"days_since_last_success":days_since,"prior_contacts":0,"customer_value":row["customer_value"] or row["amount"],"event_age_hours":days*24,"consent_to_email":bool(row["customer_email"]),"payment_gateway":merchant["payment_gateway"] or "payu","customer_id":row["customer_id"],"bill_id":row["id"]}
-        decision=hydrate(event); eid=insert_event(event,decision,merchant["id"]); created.append({"id":eid,"customer":row["customer_name"],"amount":row["amount"],"days_overdue":days,"risk_score":decision.risk_score,"recommended_action":decision.recommended_action,"recovery_probability":decision.recovery_probability})
-    audit(None,"customer_history_scan","scanned",f"Scanned customer histories and created {len(created)} new leak event(s).",merchant["id"])
-    return {"ok":True,"count":len(created),"created":created}
+        last_paid=row["last_paid_date"]
+        days_since=90 if not last_paid else max(0,(today-datetime.fromisoformat(last_paid).date()).days)
+        event={
+            "event_type":"invoice_overdue", "customer":row["customer_name"], "customer_email":row["customer_email"],
+            "amount":row["amount"], "currency":row["currency"], "external_id":f"history:{row['id']}",
+            "source":"customer_history_scanner", "days_overdue":days, "previous_success_rate":success,
+            "days_since_last_success":days_since, "prior_contacts":0, "customer_value":row["customer_value"] or row["amount"],
+            "event_age_hours":days*24, "consent_to_email":bool(row["customer_email"]),
+            "payment_gateway":merchant["payment_gateway"] or "payu", "customer_id":row["customer_id"], "bill_id":row["id"],
+        }
+        decision=hydrate(event)
+        eid=insert_event(event,decision,merchant_id)
+        created.append({"id":eid,"customer":row["customer_name"],"amount":row["amount"],"days_overdue":days,"risk_score":decision.risk_score,"recommended_action":decision.recommended_action,"recovery_probability":decision.recovery_probability})
+
+    action_counts={}
+    for item in created:
+        action_counts[item["recommended_action"]]=action_counts.get(item["recommended_action"],0)+1
+    audit(
+        None,"customer_history_scan","scanned",
+        f"Re-evaluated {len(customer_rows)} customer(s) from current histories; superseded {previous} prior leak suggestion(s) and created {len(created)} fresh leak event(s).",
+        merchant_id
+    )
+    return {
+        "ok":True, "customers_evaluated":len(customer_rows), "superseded":previous,
+        "count":len(created), "created":created, "action_counts":action_counts,
+        "message":f"Re-evaluated {len(customer_rows)} customer(s) and generated {len(created)} fresh leak suggestion(s)."
+    }
 
 @app.post("/api/checkout/events")
 def checkout_event(event: CheckoutEventIn, merchant: sqlite3.Row = Depends(lambda authorization=Header(default=None): merchant_from_token(authorization))):

@@ -155,7 +155,8 @@ def bounded_decision(event: dict[str, Any], probability: float) -> Decision:
             action = "send_payment_link"
             reason = (
                 f"The invoice is {days_overdue} days overdue and the model estimates a {_pct(probability)} recovery chance. "
-                f"A direct payment link reduces friction and gives the customer a clear way to settle the balance."
+                f"A direct payment link reduces friction and gives the customer a clear way to settle the balance. "
+                f"Once the link is created, the recommended follow-up is a personalized recovery email containing that link."
             )
             delay = 0
         elif probability >= 0.35 and prior_contacts < 3:

@@ -57,3 +57,9 @@ def test_risk_reason_contains_model_and_context():
     decision = bounded_decision(base(event_type="invoice_overdue", days_overdue=8, prior_contacts=1), 0.55)
     assert "8 days overdue" in decision.risk_reason
     assert "model recovery probability 55%" in decision.risk_reason
+
+
+def test_payment_link_recommendation_includes_email_followup():
+    decision = bounded_decision(base(event_type="invoice_overdue", days_overdue=7, previous_success_rate=0.80, prior_contacts=0), 0.70)
+    assert decision.recommended_action == "send_payment_link"
+    assert "personalized recovery email" in decision.action_reason
