@@ -1,3 +1,4 @@
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=Manrope:wght@500;600;700;800&display=swap');
 @tailwind base;
 @tailwind components;
 @tailwind utilities;
@@ -81,8 +82,8 @@ button,input,select{font:inherit}
   content:"";position:absolute;inset:auto 0 0 0;height:180px;pointer-events:none;
   background:radial-gradient(circle at 50% 100%, #0052ff44, transparent 68%);
 }
-.brand-logo{display:grid;place-items:center;border-radius:12px;color:#fff;background:linear-gradient(145deg,#1765ff,#00a7e8);box-shadow:0 10px 24px #0052ff52;flex:none}
-.brand-logo svg{width:68%;height:68%}
+.brand-logo{display:grid;place-items:center;border-radius:12px;color:#fff;background:rgba(9,15,35,.72);border:1px solid rgba(120,170,255,.16);box-shadow:0 10px 24px rgba(0,0,0,.22),0 0 20px rgba(0,82,255,.10);flex:none;overflow:hidden}
+.brand-logo-image{width:84%;height:84%;object-fit:contain;display:block;filter:drop-shadow(0 4px 10px rgba(0,0,0,.14))}
 .tab-icon{width:19px;height:19px;flex:none;stroke-width:1.85}
 .nav-btn-active .tab-icon{filter:drop-shadow(0 0 7px #00e0ff88)}
 .nav-btn{border-radius:13px;position:relative;overflow:hidden;}
@@ -127,3 +128,215 @@ header{background:#101221;border-bottom:1px solid #22253a}
 @media (prefers-reduced-motion:reduce){
   *,*::before,*::after{animation:none!important;transition:none!important;scroll-behavior:auto!important}
 }
+/* Landing experience and smoother motion */
+.landing-shell{min-height:100vh;padding:24px 7vw;position:relative}.landing-nav{display:flex;align-items:center;justify-content:space-between;max-width:1200px;margin:auto;padding:8px 0}.landing-hero{max-width:1200px;margin:0 auto;min-height:70vh;display:grid;grid-template-columns:1.15fr .85fr;align-items:center;gap:70px}.landing-copy h1{font-size:clamp(3.3rem,7vw,6.8rem);line-height:.98;letter-spacing:-.065em;margin:18px 0}.landing-copy h1 span{background:linear-gradient(90deg,#00e0ff,#4d7cff);-webkit-background-clip:text;background-clip:text;color:transparent}.landing-copy p{max-width:640px;font-size:1.08rem;line-height:1.75;color:#9eabc6}.landing-actions{display:flex;gap:12px;margin-top:28px}.landing-visual{position:relative;min-height:420px;display:grid;place-items:center}.orb{position:absolute;width:420px;height:420px;border-radius:50%;background:radial-gradient(circle,#0052ff66,transparent 67%);filter:blur(8px);animation:float 6s ease-in-out infinite}.flow-card{position:relative;width:min(100%,380px);padding:28px;border:1px solid #3152a8;background:linear-gradient(145deg,#131b39e8,#0e1122e8);border-radius:28px;box-shadow:0 35px 80px #0009}.flow-step{margin-top:18px;padding:16px 18px;border:1px solid #313952;border-radius:16px;background:#171b30}.flow-step.active{border-color:#00e0ff;background:#00e0ff12;box-shadow:0 0 24px #00e0ff22}.flow-arrow{text-align:center;color:#00e0ff;margin:7px}.landing-grid{max-width:1200px;margin:0 auto 50px;display:grid;grid-template-columns:repeat(3,1fr);gap:18px}.landing-grid>div{padding:25px;border:1px solid var(--line);border-radius:20px;background:#14172bcc}.landing-grid b{color:#00e0ff;font-size:.75rem}.landing-grid h3{font-size:1.25rem;margin:12px 0 6px}.landing-grid p{color:#94a3b8;line-height:1.6;font-size:.9rem}@keyframes float{50%{transform:translateY(-18px) scale(1.03)}}
+.global-loader{position:fixed;inset:0;z-index:120;display:grid;place-items:center;background:#080a17aa;backdrop-filter:blur(7px)}.loader-card{min-width:250px;text-align:center;padding:30px;border-radius:24px;background:#14172b;border:1px solid #3152a8;box-shadow:0 25px 80px #000a}.loader-ring{width:46px;height:46px;border-radius:50%;border:3px solid #ffffff18;border-top-color:#00e0ff;border-right-color:#0052ff;margin:0 auto 18px;animation:spin .85s linear infinite}@keyframes spin{to{transform:rotate(360deg)}}button:active{transform:scale(.98)}
+@media(max-width:800px){.landing-shell{padding:18px 5vw}.landing-hero{grid-template-columns:1fr;gap:15px;padding:55px 0}.landing-copy h1{font-size:3.5rem}.landing-visual{min-height:330px}.orb{width:330px;height:330px}.landing-grid{grid-template-columns:1fr}.landing-nav{gap:15px}}
+.loader-card{animation:loaderEnter .28s ease-out;min-width:290px;text-align:center}.loader-dots{display:flex;justify-content:center;gap:6px;margin-top:14px}.loader-dots i{width:6px;height:6px;border-radius:50%;background:currentColor;opacity:.35;animation:dotPulse 1.1s infinite}.loader-dots i:nth-child(2){animation-delay:.15s}.loader-dots i:nth-child(3){animation-delay:.3s}@keyframes dotPulse{0%,100%{transform:translateY(0);opacity:.25}50%{transform:translateY(-5px);opacity:1}}@keyframes loaderEnter{from{opacity:0;transform:translateY(10px) scale(.97)}to{opacity:1;transform:none}}
+
+/* Unified Revive AI logo loader */
+.global-loader{background:rgba(5,7,18,.70);backdrop-filter:blur(12px);animation:loaderFade .22s ease-out}
+.logo-loader-card{position:relative;min-width:300px;overflow:hidden;padding:42px 34px 34px;border-color:rgba(0,224,255,.28);background:linear-gradient(145deg,rgba(20,23,43,.98),rgba(9,12,28,.98));box-shadow:0 30px 100px rgba(0,0,0,.62),0 0 55px rgba(0,82,255,.18)}
+.logo-loader-mark{position:relative;z-index:3;width:76px;height:76px;margin:0 auto 18px;display:grid;place-items:center;animation:logoPulse 1.7s ease-in-out infinite}
+.logo-loader-mark .brand-logo{width:68px!important;height:68px!important;border-radius:20px;box-shadow:0 0 0 8px rgba(0,224,255,.045),0 14px 36px rgba(0,82,255,.42)}
+.logo-loader-orbit{position:absolute;left:50%;top:32px;width:116px;height:116px;margin-left:-58px;border-radius:50%;border:1px solid rgba(0,224,255,.25);pointer-events:none}
+.orbit-one{border-right-color:#00e0ff;border-bottom-color:#0052ff;animation:logoOrbit 1.9s linear infinite}
+.orbit-two{width:142px;height:142px;margin-left:-71px;top:19px;border-color:rgba(0,82,255,.14);border-left-color:rgba(0,224,255,.55);animation:logoOrbitReverse 3.1s linear infinite}
+.loader-brand{position:relative;z-index:2;font-size:.72rem;font-weight:900;letter-spacing:.28em;color:#dce9ff;margin-bottom:12px}.loader-title{position:relative;z-index:2;font-size:1.05rem;font-weight:750;color:#fff}.loader-subtitle{position:relative;z-index:2;margin-top:7px;font-size:.78rem;line-height:1.45;color:#94a3b8}
+@keyframes logoOrbit{to{transform:rotate(360deg)}}@keyframes logoOrbitReverse{to{transform:rotate(-360deg)}}@keyframes logoPulse{0%,100%{transform:scale(1);filter:brightness(1)}50%{transform:scale(1.06);filter:brightness(1.16)}}@keyframes loaderFade{from{opacity:0}to{opacity:1}}
+
+/* --------------------------------------------------------------------------
+   Revive AI visual refinement: typography, centered loader and living canvas
+   -------------------------------------------------------------------------- */
+
+:root{
+  --font-ui: 'Inter', ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+  --font-display: 'Manrope', 'Inter', ui-sans-serif, system-ui, sans-serif;
+  --revive-scroll: 0px;
+  --revive-scroll-progress: 0;
+  --revive-bg-shift: 0px;
+  --revive-grid-shift: 0px;
+  --revive-bg-scale: 1;
+}
+html{scroll-behavior:smooth;}
+body{font-family:var(--font-ui);}
+h1,h2,h3,h4,h5,h6,.loader-brand,.loader-title,.brand-kicker,.landing-copy h1{
+  font-family:var(--font-display);
+  text-wrap:balance;
+}
+button,.primary-btn,.simulate-btn,.nav-btn{font-family:var(--font-ui);}
+
+/* A layered aurora canvas that slowly moves on its own and shifts with scroll. */
+.app-shell{
+  min-height:100vh;
+  isolation:isolate;
+  background:
+    radial-gradient(1100px 720px at 8% -8%, rgba(25,72,190,.22), transparent 66%),
+    radial-gradient(900px 680px at 92% 6%, rgba(0,185,255,.12), transparent 65%),
+    #090b18;
+}
+.app-shell::before{
+  z-index:-2;
+  inset:-18%;
+  width:136%;
+  height:136%;
+  opacity:.95;
+  background:
+    radial-gradient(circle at 18% 24%, rgba(0,224,255,.16) 0 7%, transparent 22%),
+    radial-gradient(circle at 74% 18%, rgba(48,86,255,.22) 0 10%, transparent 27%),
+    radial-gradient(circle at 52% 76%, rgba(0,129,255,.14) 0 9%, transparent 28%),
+    radial-gradient(circle at 22% 88%, rgba(81,58,255,.14) 0 7%, transparent 24%);
+  filter:blur(28px) saturate(118%);
+  transform:translate3d(0, var(--revive-bg-shift), 0) scale(var(--revive-bg-scale));
+  animation:reviveAurora 20s ease-in-out infinite alternate;
+  will-change:transform;
+}
+.app-shell::after{
+  content:"";
+  position:fixed;
+  inset:0;
+  z-index:-1;
+  pointer-events:none;
+  opacity:.28;
+  background-image:
+    linear-gradient(rgba(116,145,255,.045) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(116,145,255,.04) 1px, transparent 1px),
+    radial-gradient(circle at 50% 0%, rgba(255,255,255,.035), transparent 42%);
+  background-size:52px 52px,52px 52px,100% 100%;
+  background-position:0 var(--revive-grid-shift),0 var(--revive-grid-shift),center;
+  mask-image:linear-gradient(to bottom, transparent, black 18%, black 82%, transparent);
+}
+.app-surface{background:linear-gradient(180deg, rgba(9,11,24,.12), rgba(9,11,24,.35));}
+@keyframes reviveAurora{
+  0%{filter:blur(28px) saturate(112%) hue-rotate(0deg);}
+  50%{filter:blur(34px) saturate(128%) hue-rotate(8deg);}
+  100%{filter:blur(30px) saturate(118%) hue-rotate(-5deg);}
+}
+
+/* Typography hierarchy inspired by contemporary AI/SaaS interfaces. */
+.landing-copy h1{font-weight:800;letter-spacing:-.06em;}
+.surface-panel h2,.surface-panel h3{letter-spacing:-.025em;font-weight:700;}
+.loader-title{font-family:var(--font-display);font-weight:700;letter-spacing:-.025em;}
+.loader-subtitle{font-family:var(--font-ui);}
+
+/* Rebuilt loader geometry: every visual layer now shares one centered stage. */
+.global-loader{display:flex;align-items:center;justify-content:center;padding:24px;}
+.logo-loader-card{
+  width:min(92vw,390px);
+  min-width:0;
+  margin:0;
+  display:flex;
+  flex-direction:column;
+  align-items:center;
+  justify-content:center;
+  text-align:center;
+  padding:30px 30px 28px;
+}
+.loader-logo-stage{
+  position:relative;
+  width:156px;
+  height:156px;
+  margin:0 auto 2px;
+  display:grid;
+  place-items:center;
+  flex:none;
+}
+.logo-loader-mark{
+  position:relative;
+  inset:auto;
+  z-index:3;
+  width:76px;
+  height:76px;
+  margin:0;
+  display:grid;
+  place-items:center;
+}
+.logo-loader-orbit{
+  position:absolute;
+  left:50%;
+  top:50%;
+  margin:0;
+  transform:translate(-50%,-50%);
+}
+.orbit-one{width:116px;height:116px;animation:logoOrbitCentered 1.9s linear infinite;}
+.orbit-two{width:142px;height:142px;animation:logoOrbitReverseCentered 3.1s linear infinite;}
+.loader-brand{
+  width:100%;
+  margin:4px 0 10px;
+  font-size:.72rem;
+  line-height:1.2;
+  letter-spacing:.24em;
+  text-indent:.24em;
+}
+.loader-title{width:100%;margin:0;font-size:1.1rem;line-height:1.35;}
+.loader-subtitle{width:100%;max-width:280px;margin:8px auto 0;font-size:.84rem;line-height:1.55;}
+@keyframes logoOrbitCentered{
+  from{transform:translate(-50%,-50%) rotate(0deg)}
+  to{transform:translate(-50%,-50%) rotate(360deg)}
+}
+@keyframes logoOrbitReverseCentered{
+  from{transform:translate(-50%,-50%) rotate(0deg)}
+  to{transform:translate(-50%,-50%) rotate(-360deg)}
+}
+
+@media(max-width:640px){
+  .logo-loader-card{width:min(94vw,350px);padding:26px 22px 24px;}
+  .loader-logo-stage{width:142px;height:142px;}
+  .loader-brand{font-size:.68rem;}
+  .loader-subtitle{font-size:.8rem;}
+  .app-shell::after{background-size:42px 42px,42px 42px,100% 100%;}
+}
+@media(prefers-reduced-motion:reduce){
+  .app-shell::before{transform:none!important;animation:none!important;}
+  .app-shell::after{background-position:center!important;}
+}
+
+/* --------------------------------------------------------------------------
+   Modal UX + stronger living background
+   -------------------------------------------------------------------------- */
+.modal-backdrop{
+  background:rgba(4,7,20,.58);
+  backdrop-filter:blur(2px);
+  -webkit-backdrop-filter:blur(2px);
+}
+.modal-dialog{
+  max-height:min(92vh, 860px);
+  display:flex;
+  flex-direction:column;
+  overflow:hidden;
+  background:linear-gradient(145deg,rgba(20,23,43,.985),rgba(9,12,28,.985));
+  border:1px solid rgba(0,224,255,.26);
+  box-shadow:0 30px 110px rgba(0,0,0,.58),0 0 42px rgba(0,82,255,.12);
+}
+.modal-header{border-bottom:1px solid rgba(255,255,255,.07)}
+.modal-body{
+  scrollbar-width:thin;
+  scrollbar-color:rgba(80,130,255,.55) transparent;
+}
+.modal-body::-webkit-scrollbar{width:8px}
+.modal-body::-webkit-scrollbar-track{background:transparent}
+.modal-body::-webkit-scrollbar-thumb{background:rgba(80,130,255,.5);border-radius:999px;border:2px solid transparent;background-clip:padding-box}
+.modal-body::-webkit-scrollbar-thumb:hover{background:rgba(0,224,255,.62);background-clip:padding-box}
+
+/* Keep the animated background visible instead of burying it under opaque layers. */
+.app-shell::before{
+  opacity:1;
+  filter:blur(14px) saturate(125%);
+}
+.app-surface{background:linear-gradient(180deg,rgba(9,11,24,.04),rgba(9,11,24,.16));}
+.global-loader{
+  background:rgba(4,7,20,.48);
+  backdrop-filter:blur(2px);
+  -webkit-backdrop-filter:blur(2px);
+}
+@media(max-width:640px){
+  .modal-dialog{max-height:94vh;border-radius:24px}
+}
+
+/* User-provided Revive AI logo */
+.brand-logo-image{user-select:none;-webkit-user-drag:none;}
+.logo-loader-mark .brand-logo{background:transparent!important;box-shadow:none!important;overflow:visible;}
+.logo-loader-mark .brand-logo-image{width:100%;height:100%;object-fit:contain;filter:drop-shadow(0 10px 22px rgba(0,82,255,.38));}
+.loader-logo-stage .logo-loader-mark{display:grid;place-items:center;}
+.landing-nav .brand-logo-image,.sidebar-shell .brand-logo-image{filter:drop-shadow(0 6px 14px rgba(0,82,255,.28));}
+@media (max-width:640px){.brand-logo{border-radius:11px}.brand-logo-image{width:86%;height:86%;}}

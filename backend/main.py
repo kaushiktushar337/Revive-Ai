@@ -18,12 +18,13 @@ except ImportError:
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
+from contextlib import asynccontextmanager
 
 from fastapi import Depends, FastAPI, File, Header, HTTPException, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
-from config import APP_ENV, CORS_ORIGINS, PUBLIC_BASE_URL, RAZORPAY_KEY_ID, RAZORPAY_WEBHOOK_SECRET
+from config import APP_ENV, CORS_ORIGINS, PUBLIC_BASE_URL, RAZORPAY_KEY_ID, RAZORPAY_WEBHOOK_SECRET, EMAIL_PROVIDER, BREVO_API_KEY, EMAIL_FROM, EMAIL_FROM_NAME
 from engine import bounded_decision
 from model import predict_probability
 from razorpay_adapter import create_payment_link, fetch_payment_link, test_connection, verify_webhook_signature
@@ -55,7 +56,22 @@ class PostgresConnection:
     def close(self): self.raw.close()
 
 
-app = FastAPI(title="Revive API", version="0.3.0", description="AI revenue recovery prototype API")
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    init_db()
+    conn = db()
+    count = conn.execute("SELECT COUNT(*) AS c FROM events").fetchone()["c"]
+    conn.close()
+    if count == 0 and SEED.exists():
+        events = json.loads(SEED.read_text(encoding="utf-8"))
+        # Seed only the demo merchant when the database is empty.
+        for event in events:
+            decision = hydrate(event)
+            insert_event(event, decision, "m_demo")
+    yield
+
+
+app = FastAPI(title="Revive API", version="0.3.0", description="AI revenue recovery prototype API", lifespan=lifespan)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=CORS_ORIGINS,
@@ -69,10 +85,8 @@ class MerchantSignupIn(BaseModel):
     business_name: str = Field(min_length=2, max_length=120)
     login_email: str = Field(min_length=5, max_length=200)
     password: str = Field(min_length=8, max_length=200)
-    sender_email: str = Field(min_length=5, max_length=200)
+    sender_email: str | None = Field(default=None, max_length=200)
     use_demo_email: bool = True
-    email_provider: str = Field(default="demo", pattern="^(demo|resend)$")
-    resend_api_key: str | None = Field(default=None, max_length=300)
 
 class MerchantLoginIn(BaseModel):
     login_email: str
@@ -96,10 +110,8 @@ class ActiveGatewayIn(BaseModel):
     gateway: str = Field(pattern="^(payu|razorpay)$")
 
 class MerchantEmailSettingsIn(BaseModel):
-    sender_email: str = Field(min_length=5, max_length=200)
+    # Sender/provider are controlled globally through Render environment variables.
     use_demo_email: bool = True
-    email_provider: str = Field(default="demo", pattern="^(demo|resend)$")
-    resend_api_key: str | None = Field(default=None, max_length=300)
 
 
 def merchant_from_token(authorization: str | None) -> sqlite3.Row:
@@ -305,8 +317,8 @@ def init_db():
     ensure_column(conn, "events", "consent_to_email", "INTEGER DEFAULT 0")
     ensure_column(conn, "merchants", "email_provider", "TEXT DEFAULT 'demo'")
     ensure_column(conn, "merchants", "resend_api_key", "TEXT")
-    # Migrate legacy SMTP/non-demo merchants to Resend as the hosted provider.
-    conn.execute("UPDATE merchants SET email_provider=CASE WHEN use_demo_email=1 THEN 'demo' ELSE 'resend' END WHERE email_provider IS NULL OR email_provider='' OR (email_provider='demo' AND use_demo_email=0)")
+    # Migrate legacy SMTP/non-demo merchants to Brevo as the hosted provider.
+    conn.execute("UPDATE merchants SET email_provider=CASE WHEN use_demo_email=1 THEN 'demo' ELSE 'brevo' END WHERE email_provider IS NULL OR email_provider='' OR (email_provider='demo' AND use_demo_email=0)")
     ensure_column(conn, "merchants", "razorpay_key_id", "TEXT")
     ensure_column(conn, "merchants", "razorpay_key_secret", "TEXT")
     ensure_column(conn, "merchants", "razorpay_webhook_secret", "TEXT")
@@ -374,7 +386,7 @@ def init_db():
     conn.close()
 
 
-def audit(event_id: str | None, action: str, status: str, detail: str, merchant_id: str | None = "m_demo"):
+def audit(event_id: str | None, action: str, status: str, detail: str, merchant_id: str | None = None):
     conn = db()
     conn.execute(
         "INSERT INTO audit_logs(id,merchant_id,event_id,action,status,detail,created_at) VALUES(?,?,?,?,?,?,?)",
@@ -496,36 +508,22 @@ def event_payload_to_internal(payload: dict[str, Any], source: str = "razorpay")
     return None
 
 
-@app.on_event("startup")
-def startup():
-    init_db()
-    conn = db()
-    count = conn.execute("SELECT COUNT(*) AS c FROM events").fetchone()["c"]
-    conn.close()
-    if count == 0 and SEED.exists():
-        events = json.loads(SEED.read_text(encoding="utf-8"))
-        for event in events:
-            decision = hydrate(event)
-            insert_event(event, decision)
-
 
 @app.post("/api/auth/register")
 def register_merchant(payload: MerchantSignupIn):
     init_db()
     email = payload.login_email.strip().lower()
-    sender = payload.sender_email.strip().lower()
+    sender = EMAIL_FROM or "demo@revive.local"
+    provider = "demo" if payload.use_demo_email or EMAIL_PROVIDER == "demo" else "brevo"
+    if provider == "brevo" and (not BREVO_API_KEY or not EMAIL_FROM):
+        raise HTTPException(status_code=503, detail="Hosted email is not configured. Set BREVO_API_KEY and EMAIL_FROM on Render.")
     conn = db()
     if conn.execute("SELECT id FROM merchants WHERE login_email=?", (email,)).fetchone():
         conn.close(); raise HTTPException(status_code=409, detail="An account with this login email already exists")
-    merchant_id = f"m_{uuid.uuid4().hex[:10]}"
-    now = datetime.now(timezone.utc).isoformat()
-    provider = "demo" if payload.use_demo_email else payload.email_provider
-    if provider == "resend" and not payload.resend_api_key:
-        conn.close(); raise HTTPException(status_code=400, detail="Resend mode requires a Resend API key")
-    conn.execute("INSERT INTO merchants(id,business_name,login_email,password_hash,sender_email,use_demo_email,email_provider,resend_api_key,active,created_at) VALUES(?,?,?,?,?,?,?,?,?,?)", (merchant_id,payload.business_name.strip(),email,hash_password(payload.password),sender,1 if provider == "demo" else 0,provider,payload.resend_api_key or None,1,now))
+    merchant_id = f"m_{uuid.uuid4().hex[:10]}"; now = datetime.now(timezone.utc).isoformat()
+    conn.execute("INSERT INTO merchants(id,business_name,login_email,password_hash,sender_email,use_demo_email,email_provider,active,created_at) VALUES(?,?,?,?,?,?,?,?,?)", (merchant_id,payload.business_name.strip(),email,hash_password(payload.password),sender,1 if provider == "demo" else 0,provider,1,now))
     conn.execute("INSERT INTO users(id,merchant_id,email,role,created_at,active) VALUES(?,?,?,?,?,?)", (f"u_{uuid.uuid4().hex[:10]}", merchant_id, email, "owner", now, 1))
-    conn.commit(); conn.close()
-    token = issue_token(merchant_id)
+    conn.commit(); conn.close(); token = issue_token(merchant_id)
     return {"ok": True, "token": token, "merchant": {"id": merchant_id, "business_name": payload.business_name.strip(), "login_email": email, "sender_email": sender, "use_demo_email": provider == "demo", "email_provider": provider}}
 
 @app.post("/api/auth/login")
@@ -534,7 +532,7 @@ def login_merchant(payload: MerchantLoginIn):
     if not row or not verify_password(payload.password, row["password_hash"]):
         raise HTTPException(status_code=401, detail="Invalid login email or password")
     token = issue_token(row["id"])
-    return {"ok": True, "token": token, "merchant": {"id": row["id"], "business_name": row["business_name"], "login_email": row["login_email"], "sender_email": row["sender_email"], "use_demo_email": bool(row["use_demo_email"]), "email_provider": row["email_provider"] or ("demo" if row["use_demo_email"] else "resend")}}
+    return {"ok": True, "token": token, "merchant": {"id": row["id"], "business_name": row["business_name"], "login_email": row["login_email"], "sender_email": row["sender_email"], "use_demo_email": bool(row["use_demo_email"]), "email_provider": row["email_provider"] or ("demo" if row["use_demo_email"] else "brevo")}}
 
 @app.get("/api/auth/me")
 def me(merchant: sqlite3.Row = Depends(lambda authorization=Header(default=None): merchant_from_token(authorization))):
@@ -544,8 +542,9 @@ def me(merchant: sqlite3.Row = Depends(lambda authorization=Header(default=None)
         "login_email": merchant["login_email"],
         "sender_email": merchant["sender_email"],
         "use_demo_email": bool(merchant["use_demo_email"]),
-        "email_provider": merchant["email_provider"] or ("demo" if merchant["use_demo_email"] else "resend"),
-        "resend_configured": bool(merchant["resend_api_key"]),
+        "email_provider": merchant["email_provider"] or ("demo" if merchant["use_demo_email"] else "brevo"),
+        "brevo_configured": bool(BREVO_API_KEY and EMAIL_FROM),
+        "email_sender_name": EMAIL_FROM_NAME,
         "smtp_configured": False,
         "razorpay_configured": bool(merchant["razorpay_key_id"] and merchant["razorpay_key_secret"]),
         "razorpay_webhook_configured": bool(merchant["razorpay_webhook_secret"]),
@@ -561,16 +560,11 @@ def me(merchant: sqlite3.Row = Depends(lambda authorization=Header(default=None)
 
 @app.put("/api/auth/email-settings")
 def update_email_settings(payload: MerchantEmailSettingsIn, merchant: sqlite3.Row = Depends(lambda authorization=Header(default=None): merchant_from_token(authorization))):
-    sender = payload.sender_email.strip().lower()
-    provider = "demo" if payload.use_demo_email else payload.email_provider
-    if provider == "resend" and not (payload.resend_api_key or merchant["resend_api_key"]):
-        raise HTTPException(status_code=400, detail="Resend mode requires a Resend API key")
-    conn = db()
-    conn.execute(
-        "UPDATE merchants SET sender_email=?,use_demo_email=?,email_provider=?,resend_api_key=COALESCE(?, resend_api_key) WHERE id=?",
-        (sender,1 if provider == "demo" else 0,provider,payload.resend_api_key or None,merchant["id"]),
-    )
-    conn.commit(); conn.close()
+    provider = "demo" if payload.use_demo_email or EMAIL_PROVIDER == "demo" else "brevo"
+    if provider == "brevo" and (not BREVO_API_KEY or not EMAIL_FROM):
+        raise HTTPException(status_code=503, detail="Hosted email is not configured. Set BREVO_API_KEY and EMAIL_FROM on Render.")
+    sender = EMAIL_FROM or "demo@revive.local"
+    conn = db(); conn.execute("UPDATE merchants SET sender_email=?,use_demo_email=?,email_provider=? WHERE id=?", (sender,1 if provider == "demo" else 0,provider,merchant["id"])); conn.commit(); conn.close()
     audit(None, "email_settings", "saved", f"Email provider set to {provider}.", merchant["id"])
     return {"ok": True, "sender_email": sender, "use_demo_email": provider == "demo", "email_provider": provider}
 
@@ -659,11 +653,9 @@ def test_email_delivery(payload: EmailTestIn, merchant: sqlite3.Row = Depends(la
     recipient = payload.recipient.strip().lower()
     if "@" not in recipient:
         raise HTTPException(status_code=400, detail="Enter a valid test recipient email")
-    if not merchant["sender_email"]:
-        raise HTTPException(status_code=400, detail="Set a recovery sender email first")
-    provider = merchant["email_provider"] or ("demo" if merchant["use_demo_email"] else "resend")
-    if provider == "resend" and not merchant["resend_api_key"]:
-        raise HTTPException(status_code=400, detail="Configure a Resend API key before sending a real test email")
+    provider = merchant["email_provider"] or ("demo" if merchant["use_demo_email"] else "brevo")
+    if provider == "brevo" and (not BREVO_API_KEY or not EMAIL_FROM):
+        raise HTTPException(status_code=503, detail="Hosted email is not configured on the server")
 
     subject = "ReviveAI test email"
     body = (
@@ -676,10 +668,11 @@ def test_email_delivery(payload: EmailTestIn, merchant: sqlite3.Row = Depends(la
     result = send_email(
         recipient, subject, body,
         {
-            "from_email": merchant["sender_email"],
+            "from_email": EMAIL_FROM or merchant["sender_email"],
             "mocked": provider == "demo",
             "provider": provider,
-            "resend_api_key": merchant["resend_api_key"],
+            "brevo_api_key": BREVO_API_KEY,
+            "from_name": EMAIL_FROM_NAME,
             "smtp_host": None,
             "smtp_port": 587,
             "smtp_username": None,
@@ -705,10 +698,20 @@ def root():
 
 @app.get("/api/health")
 def health():
+    database_ok = False
+    try:
+        conn = db()
+        conn.execute("SELECT 1").fetchone()
+        conn.close()
+        database_ok = True
+    except Exception:
+        database_ok = False
     return {
-        "ok": True,
+        "ok": database_ok,
         "service": "revive-api",
         "environment": APP_ENV,
+        "database": "postgres" if DATABASE_URL else "sqlite",
+        "database_ok": database_ok,
         "razorpay": {"configured": bool(RAZORPAY_KEY_ID), "webhook_verification": bool(RAZORPAY_WEBHOOK_SECRET)},
     }
 
@@ -843,8 +846,8 @@ def execute_event(event_id: str, merchant: sqlite3.Row = Depends(lambda authoriz
     )
     conn.commit()
     conn.close()
-    audit(event_id, action, status.lower(), message)
-    return {"id": event_id, "action": action, "status": status, "lifecycle_status": lifecycle, "recovered": False, "amount": row["amount"], "reference": reference, "action_payload": action_payload, "message": message}
+    audit(event_id, action, status.lower(), message, merchant["id"])
+    return {"id": event_id, "action": action, "status": status, "lifecycle_status": lifecycle, "recovered": False, "amount": row["amount"], "reference": reference, "payment_link_id": link_id, "payment_link_url": link_url, "gateway": event_gateway, "action_payload": action_payload, "message": message}
 
 
 @app.post("/api/events/{event_id}/sync-payment-link")
@@ -883,7 +886,7 @@ def confirm_recovered(event_id: str, merchant: sqlite3.Row = Depends(lambda auth
     conn.execute("UPDATE events SET action_status='recovered', lifecycle_status='RECOVERED', recovered=1, recovered_at=?, recovered_amount=amount, outcome_source='manual_demo' WHERE id=?", (now, event_id))
     conn.commit()
     conn.close()
-    audit(event_id, "recovery_confirmed", "recovered", f"₹{row['amount']:,.2f} marked recovered in demo.")
+    audit(event_id, "recovery_confirmed", "recovered", f"₹{row['amount']:,.2f} marked recovered in demo.", merchant["id"])
     return {"id": event_id, "status": "recovered", "recovered": True, "amount": row["amount"]}
 
 
@@ -1239,6 +1242,8 @@ class RecoveryEmailIn(BaseModel):
     event_id: str
     recipient: str = Field(min_length=3)
     consent: bool = False
+    subject: str | None = Field(default=None, max_length=300)
+    body: str | None = Field(default=None, max_length=20000)
 
 
 def _email_content(row: sqlite3.Row) -> tuple[str, str]:
@@ -1282,17 +1287,21 @@ def send_recovery_email(payload: RecoveryEmailIn, merchant: sqlite3.Row = Depend
         conn.close(); raise HTTPException(status_code=400, detail="Email consent is required")
     if row["contact_count"] >= 3:
         conn.close(); raise HTTPException(status_code=429, detail="Contact limit reached")
-    subject, body = _email_content(row)
-    provider = merchant["email_provider"] or ("demo" if merchant["use_demo_email"] else "resend")
-    if provider == "resend" and not merchant["resend_api_key"]:
-        raise HTTPException(status_code=400, detail="Configure a Resend API key before sending a recovery email")
-    result = send_email(payload.recipient, subject, body, {"from_email": merchant["sender_email"], "mocked": provider == "demo", "provider": provider, "resend_api_key": merchant["resend_api_key"], "smtp_host": None, "smtp_port": 587, "smtp_username": None, "smtp_password": None})
+    default_subject, default_body = _email_content(row)
+    subject = (payload.subject or default_subject).strip()
+    body = (payload.body or default_body).strip()
+    if not subject or not body:
+        conn.close(); raise HTTPException(status_code=400, detail="Email subject and body cannot be empty")
+    provider = merchant["email_provider"] or ("demo" if merchant["use_demo_email"] else "brevo")
+    if provider == "brevo" and (not BREVO_API_KEY or not EMAIL_FROM):
+        raise HTTPException(status_code=503, detail="Hosted email is not configured on the server")
+    result = send_email(payload.recipient, subject, body, {"from_email": EMAIL_FROM or merchant["sender_email"], "from_name": EMAIL_FROM_NAME, "mocked": provider == "demo", "provider": provider, "brevo_api_key": BREVO_API_KEY})
     now = datetime.now(timezone.utc).isoformat()
     if result.get("ok"):
         conn.execute("UPDATE events SET customer_email=?, consent_to_email=1, contact_count=COALESCE(contact_count,0)+1, last_contact_at=?, action_status='EXECUTED', lifecycle_status='AWAITING_OUTCOME', action_reference=? WHERE id=?", (payload.recipient, now, result.get("message_id"), payload.event_id))
         conn.commit()
     conn.close()
-    audit(payload.event_id, "email_recovery", "sent" if result.get("ok") else "failed", f"Recovery email {'sent' if result.get('ok') else 'failed'} to {payload.recipient}.")
+    audit(payload.event_id, "email_recovery", "sent" if result.get("ok") else "failed", f"Recovery email {'sent' if result.get('ok') else 'failed'} to {payload.recipient}.", merchant["id"])
     if not result.get("ok"):
         raise HTTPException(status_code=502, detail=result.get("error", "Email send failed"))
     return {"ok": True, "event_id": payload.event_id, "recipient": payload.recipient, "subject": subject, "message_id": result.get("message_id"), "mocked": result.get("mocked", False), "provider": result.get("provider", provider)}

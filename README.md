@@ -1,239 +1,295 @@
-# Revive — AI Revenue Recovery Agent
+# Revive AI
 
-Revive is a startup-oriented prototype that detects revenue at risk, predicts recovery probability, chooses bounded interventions, executes safe demo actions, and records the outcome.
+Revive AI is a revenue-recovery dashboard for businesses that want to find missed payments and act on them before they become lost revenue.
 
-## Current implementation
+The app takes the payment and customer data already available to a business, turns it into recovery opportunities, and gives the team a simple workflow to execute those opportunities. That includes creating a PayU payment link, checking its status, and preparing a recovery email that can be edited before it is sent.
 
-- Failed payments, abandoned checkouts, and overdue invoices
-- Synthetic ML recovery-probability model
-- Bounded decision engine with human-approval and contact-frequency limits
-- Revenue-at-risk / expected-recovery dashboard
-- Audit trail
-- Razorpay webhook ingestion endpoint with signature verification support
-- Razorpay event deduplication
-- Razorpay payment reconciliation (`payment.failed` → later `payment.captured`)
-- Read-only Razorpay credential connection test
-- Razorpay payment-link adapter (demo mode by default)
-- Checkout event ingestion + abandonment scanner
-- Overdue-invoice CSV importer
-- Idempotency via external event IDs
-- Recovery confirmation endpoint for demos
-- Automated decision-engine and Razorpay integration tests
+## What the app does
 
-## Run locally
+- Tracks customers, invoices, payments, and recovery opportunities.
+- Uses customer payment history to calculate recovery probability and risk.
+- Surfaces the highest-priority revenue leaks in the dashboard.
+- Lets you create **PayU payment links in test mode** directly from an existing recovery event. The customer name, email, amount, and reference data are taken from the event instead of being entered again.
+- Lets you open or copy the payment link as soon as it is created.
+- Generates a recovery email preview and lets you edit the recipient, subject, and body before sending.
+- Sends transactional email through **Brevo** using one server-side sender configuration.
+- Receives and syncs payment status through gateway APIs/webhooks.
+- Includes demo/simulation tools for trying the workflow without real payments.
+- Stores data in SQLite locally and can use PostgreSQL/Supabase when `DATABASE_URL` is configured.
 
-### Backend
+## Tech stack
 
-```bash
+**Frontend**
+- React 18
+- Vite 5
+- Tailwind CSS 3
+- JavaScript/JSX
+
+**Backend**
+- FastAPI
+- Python
+- scikit-learn / joblib for the recovery model
+- SQLite locally or PostgreSQL in a hosted deployment
+
+**Services**
+- Vercel for the frontend
+- Render for the FastAPI backend
+- Supabase PostgreSQL for hosted database persistence
+- PayU for payment-link creation and payment status
+- Brevo for transactional recovery email
+
+## Project structure
+
+```text
+.
+├── backend/
+│   ├── main.py
+│   ├── config.py
+│   ├── auth.py
+│   ├── engine.py
+│   ├── model.py
+│   ├── payu_adapter.py
+│   ├── razorpay_adapter.py
+│   ├── email_adapter.py
+│   ├── recovery_model.joblib
+│   ├── seed.py
+│   ├── seed_events.json
+│   ├── sample_invoices.csv
+│   ├── sample_webhook.py
+│   ├── requirements.txt
+│   └── tests...
+├── frontend/
+│   ├── src/
+│   ├── public/
+│   ├── index.html
+│   ├── package.json
+│   └── package-lock.json
+├── start_backend.bat
+├── start_frontend.bat
+└── README.md
+```
+
+## Running locally
+
+### 1. Backend
+
+Use Python 3.12 for the current configuration.
+
+```powershell
 cd backend
 python -m venv .venv
-# Windows: .venv\\Scripts\\activate
-# macOS/Linux: source .venv/bin/activate
-pip install -r requirements-dev.txt
+.venv\Scripts\activate
+pip install -r requirements.txt
 uvicorn main:app --reload --port 8000
 ```
 
-### Frontend
-
-```bash
-cd frontend
-python -m http.server 5500
-```
-
-Open http://localhost:5500.
-
-The frontend expects the backend at http://localhost:8000.
-
-## Razorpay test mode
-
-Copy `backend/.env.example` to `backend/.env` and provide Razorpay test credentials. Keep `MOCK_EXTERNAL_ACTIONS=true` while developing the UI. Set it to `false` only after the read-only connection test succeeds and you are ready to create test Payment Links.
-
-The frontend now includes **Test Razorpay connection**, which calls:
-
-`GET /api/integrations/razorpay/test`
-
-Webhook endpoint:
-
-`POST /api/webhooks/razorpay`
-
-In production, configure `RAZORPAY_WEBHOOK_SECRET`. The webhook endpoint rejects invalid signatures once that secret is configured.
-
-### Local webhook test without Razorpay
-
-Run the API locally, set `RAZORPAY_WEBHOOK_SECRET=dev_secret`, then:
-
-```bash
-python backend/sample_webhook.py --secret dev_secret --event payment.failed --payment-id pay_demo_001
-```
-
-The script sends a signed Razorpay-style event. Send it again to verify webhook deduplication. Then send a captured event with the same payment ID:
-
-```bash
-python backend/sample_webhook.py --secret dev_secret --event payment.captured --payment-id pay_demo_001
-```
-
-Revive should reconcile the original failed-payment record as recovered.
-
-## CSV invoice format
-
-Required columns:
-
-```csv
-customer,amount,due_date,invoice_id,currency,previous_success_rate,customer_value,prior_contacts,days_since_last_success
-ABC Pvt Ltd,75000,2026-08-15,INV-1001,INR,0.80,300000,1,12
-```
-
-A ready-to-use example is included at `backend/sample_invoices.csv`.
-
-Upload to `POST /api/invoices/import`.
-
-## Phase 4 — Outbound email recovery
-
-- Recovery email preview endpoint with customer-specific content
-- Email consent check before sending
-- Per-event contact limit (maximum 3 emails)
-- Mock email delivery by default for safe local demos
-- SMTP delivery support via environment variables for real testing
-- Email action audit logging and lifecycle update to `AWAITING_OUTCOME`
-
-Email endpoints:
-
-- `GET /api/events/{event_id}/email-preview`
-- `POST /api/recovery/email`
-
-Set `MOCK_EMAIL_ACTIONS=false` and configure `SMTP_HOST`, `SMTP_PORT`, `SMTP_USER`, `SMTP_PASSWORD`, and `SMTP_FROM` only when you are ready to send real messages.
-
-## Next build phases
-
-1. Real Razorpay test payment → webhook → recovery workflow demo
-2. Outbound email connector with consent, templates and rate limits
-3. WhatsApp connector after business messaging setup
-4. Merchant authentication and multi-tenant data isolation
-5. Merchant-specific recovery models and A/B experimentation
-6. Incremental-lift measurement rather than raw recovered revenue
-7. Stripe / Shopify / WooCommerce integrations
-8. Production security, observability, compliance and billing
-
-## Phase 3 — Recovery execution lifecycle
-
-- Recovery actions now follow a lifecycle: `DETECTED → RECOMMENDED → AWAITING_OUTCOME → RECOVERED` (or `ESCALATION_REQUIRED`, `LINK_EXPIRED`, `LINK_CANCELLED`, `NO_ACTION`).
-- Demo and real Razorpay Payment Links return/store the link ID, URL and reference ID.
-- `payment_link.paid`, `payment_link.partially_paid`, `payment_link.expired`, and `payment_link.cancelled` webhooks can reconcile a Revive-generated recovery link.
-- Recovered amount, recovery timestamp and outcome source are persisted for dashboard/reporting use.
-- The dashboard exposes the recovery link, lifecycle state and recovered amount where available.
-
-Razorpay's current Payment Links webhook documentation lists `payment_link.paid`, `payment_link.partially_paid`, `payment_link.cancelled` and `payment_link.expired` events; the Phase 3 webhook handler uses those states for recovery reconciliation. citeturn456888view0
-
-## Phase 5 — Merchant accounts + recovery sender mailbox
-
-Revive now supports merchant accounts and keeps dashboard/recovery data isolated by merchant.
-
-### Create a merchant ID
-
-Open the frontend and choose **Create merchant ID**. The onboarding form asks for:
-
-- Business name
-- Login email + password
-- **Recovery sender email** — the mailbox customers will see as the sender of recovery emails
-- Email mode: demo or real SMTP
-
-Demo mode is recommended while building the prototype. In real SMTP mode, authenticated SMTP credentials are required in addition to the sender email.
-
-### Default demo account
+The API should be available at:
 
 ```text
-Login email: demo@revive.local
-Password:    demo12345
-Sender:      demo@revive.local
+http://127.0.0.1:8000
 ```
 
-### Sender settings
+Health check:
 
-After login, open **Merchant Settings** to change the recovery sender mailbox. The settings page supports SMTP host, port, username and password/app-password for real delivery.
-
-For a real mailbox, the From address must be permitted by the SMTP provider. The sender email alone does not grant permission to send mail.
-
-### Authentication
-
-Protected merchant endpoints use a short-lived signed bearer token. Event, invoice, checkout, dashboard, audit and recovery-email data is scoped to the authenticated merchant.
-
-Razorpay webhooks remain public endpoints for provider callbacks. During local testing, the webhook may be attributed to the demo merchant or to a merchant supplied through `X-Revive-Merchant-Id`; production deployments should replace this with a per-merchant webhook credential/secret mapping.
-
-## Phase 5.1 — Verified recovery sender mailbox
-
-Merchant Settings now includes a **Send test email** action. Enter a recipient address and Revive sends a diagnostic message using the merchant's configured recovery sender.
-
-- Demo mode: safe mocked delivery; no external mailbox is contacted.
-- SMTP mode: validates that host, username and password/app password are present before sending.
-- The API returns the configured sender and delivery mode, but never returns the stored SMTP password.
-- Test sends are written to the merchant audit trail.
-
-Endpoint:
-
-`POST /api/auth/email-test`
-
-Payload:
-
-```json
-{"recipient":"you@example.com"}
+```text
+http://127.0.0.1:8000/api/health
 ```
 
-The merchant onboarding form already asks for the **Recovery sender email**. For real SMTP delivery, configure the sender mailbox's authenticated SMTP credentials in the merchant settings.
+### 2. Frontend
 
-## Windows quick start
-
-Use Python 3.12 for this prototype. From the `revive_phase4_work` folder:
+Use Node.js 20 or 22.
 
 ```powershell
-py -3.12 -m venv backend\.venv
-backend\.venv\Scripts\python.exe -m pip install --upgrade pip
-backend\.venv\Scripts\python.exe -m pip install -r backend\requirements-dev.txt
-backend\.venv\Scripts\python.exe -m uvicorn --app-dir backend main:app --reload --port 8000
+cd frontend
+npm install
+npm run dev
 ```
 
-The backend includes the `python-multipart` dependency required by the invoice upload endpoint.
+Vite normally serves the app at:
 
-Frontend:
+```text
+http://127.0.0.1:5173
+```
+
+The Vite configuration proxies `/api` requests to the local FastAPI server.
+
+## Environment variables
+
+### Backend
+
+Copy `backend/.env.example` and set the values for your environment.
+
+The important production settings are:
+
+```env
+REVIVE_ENV=production
+CORS_ORIGINS=https://your-vercel-domain.vercel.app
+REVIVE_AUTH_SECRET=replace-with-a-long-random-secret
+DATABASE_URL=your-supabase-postgres-connection-string
+PUBLIC_BASE_URL=https://your-render-service.onrender.com
+
+MOCK_EXTERNAL_ACTIONS=false
+
+EMAIL_PROVIDER=brevo
+BREVO_API_KEY=your-brevo-api-key
+EMAIL_FROM=no-reply@your-verified-domain.com
+EMAIL_FROM_NAME=ReviveAI
+
+PAYU_MODE=test
+```
+
+Do not commit `.env` files or any API keys to GitHub.
+
+## PayU test mode
+
+PayU credentials are stored server-side and are never put in the browser bundle.
+
+Set these values in the Render environment for a test deployment:
+
+```env
+PAYU_MODE=test
+```
+
+The PayU integration also expects the merchant ID, client ID, and client secret to be configured in the application's payment settings. The UI hides saved secrets and only reveals the editing controls when you choose to edit the settings.
+
+When a recovery event is executed, Revive AI uses the event's existing customer and payment data to create the PayU payment link. No separate payment-link form is required for the normal recovery flow.
+
+## Brevo email
+
+Revive AI uses one server-side Brevo configuration for hosted transactional email.
+
+```env
+EMAIL_PROVIDER=brevo
+BREVO_API_KEY=your-brevo-api-key
+EMAIL_FROM=no-reply@your-verified-domain.com
+EMAIL_FROM_NAME=ReviveAI
+```
+
+Verify the sender (or the domain) in Brevo before enabling real email delivery.
+
+The recovery email workflow is intentionally editable:
+
+1. Open the recovery email preview.
+2. Review the generated message.
+3. Change the recipient, subject, or body if needed.
+4. Confirm consent.
+5. Send the final version.
+
+## Database
+
+The backend supports two storage modes:
+
+- **SQLite** when `DATABASE_URL` is not set. This is useful for local demos.
+- **PostgreSQL** when `DATABASE_URL` is set. In production, this can be a Supabase PostgreSQL connection string.
+
+The deployed application should use PostgreSQL/Supabase so data survives Render restarts and redeployments.
+
+## Useful API endpoints
+
+A few of the main endpoints are:
+
+```text
+POST /api/auth/register
+POST /api/auth/login
+GET  /api/auth/me
+
+GET  /api/dashboard
+GET  /api/customers
+GET  /api/customers/{customer_id}/history
+POST /api/customers/history
+POST /api/customers/demo
+POST /api/customers/scan
+
+POST /api/events
+POST /api/events/{event_id}/execute
+POST /api/events/{event_id}/sync-payment-link
+POST /api/events/{event_id}/confirm-recovered
+
+GET  /api/events/{event_id}/email-preview
+POST /api/recovery/email
+
+GET  /api/integrations/payu/settings
+PUT  /api/integrations/payu/settings
+GET  /api/integrations/payu/test-merchant
+
+POST /api/webhooks/payu/{merchant_id}
+```
+
+## Deployment
+
+### Render
+
+Set the backend root directory to `backend`.
+
+Build command:
+
+```text
+pip install -r requirements.txt
+```
+
+Start command:
+
+```text
+uvicorn main:app --host 0.0.0.0 --port $PORT
+```
+
+Set `PYTHON_VERSION=3.12.7` if Render does not pick the version from `backend/.python-version` automatically.
+
+Also set:
+
+- `DATABASE_URL` to the Supabase PostgreSQL connection string
+- `CORS_ORIGINS` to the exact Vercel origin
+- `PUBLIC_BASE_URL` to the Render service URL
+- `REVIVE_AUTH_SECRET` to a strong random secret
+- PayU and Brevo secrets as required
+
+### Vercel
+
+Set the project root directory to `frontend`.
+
+Build command:
+
+```text
+npm run build
+```
+
+The output directory is:
+
+```text
+dist
+```
+
+Set:
+
+```env
+VITE_API_BASE_URL=https://your-render-service.onrender.com/api
+```
+
+## Testing
+
+The backend includes tests for core flows such as authentication, payment-gateway integration, email delivery, customer history, and recovery execution.
+
+Run the available test suite with:
 
 ```powershell
-python -m http.server 5500 --directory frontend
+cd backend
+pytest
 ```
 
-Open `http://127.0.0.1:5500`.
+For a quick frontend production check:
 
+```powershell
+cd frontend
+npm install
+npm run build
+```
 
-## Real Razorpay Test Mode
-1. In Razorpay Dashboard switch to Test Mode and generate a Test API Key ID/Secret. Razorpay provides separate Test and Live keys; Test Mode does not move real money.
-2. In Revive Settings → Razorpay payment gateway, choose Test Mode, paste Key ID, Key Secret, and create/configure a webhook secret.
-3. Save, then click Test API connection.
-4. Copy the merchant-specific webhook endpoint shown by Revive into Razorpay Dashboard → Account & Settings → Webhooks and subscribe to the payment/payment-link events used by the app.
-5. For localhost webhooks, expose the local server through a secure tunnel or use a staging HTTPS endpoint. Razorpay documents testing webhooks with localhost/staging and emphasizes signature verification/idempotency.
-6. Create a real Test Mode Payment Link from a Revive recovery action. Razorpay Payment Links are API-created URLs that can be paid with supported test payment methods.
-7. After payment, use the event's “Sync payment status” control if the webhook cannot reach localhost; otherwise the webhook should reconcile automatically.
-8. Never put Live credentials in a demo environment. Keep secrets out of source control.
+## Notes
 
-## Frontend update
-The frontend has been replaced with the Deep Intelligence / Stitch modern UI reference design. It keeps the full prototype functionality: merchant auth, overview metrics, risk, recovery actions, Razorpay connector, invoice CSV import, checkout scanner simulation, email sender settings/test, payment-link sync, and audit logs embedded in Overview (no separate Audit tab).
+Revive AI is currently configured around **PayU test mode** for payment-link creation. Switching to live payments should be treated as a separate production-readiness step: verify the live PayU credentials, webhook configuration, domain/email authentication, and all business rules before enabling it.
 
-Run frontend with:
-`python -m http.server 5500 --directory frontend`
+The UI is designed around a single branded Revive AI experience, including the landing page, animated background, logo-based loading state, reusable modals, and editable recovery-email workflow.
 
-## PayU Test Mode
+## License
 
-Revive uses PayU as the primary payment gateway for recovery Payment Links. The integration uses PayU's OAuth 2.0 Client Credentials flow and the Test/UAT Payment Links API.
-
-Configure these merchant fields in **Settings → PayU payment gateway**:
-- Merchant ID
-- Client ID
-- Client Secret
-- Test/Product Key (optional for hosted checkout)
-- Salt (used for response-hash verification)
-
-PayU's documented Test/UAT Payment Links endpoint is `https://uatoneapi.payu.in/payment-links`, and access tokens are obtained from `https://uat-accounts.payu.in/oauth/token` with the appropriate payment-link scopes.
-
-PayU payment webhooks should be configured at:
-`<PUBLIC_BASE_URL>/api/webhooks/payu/<merchant_id>`
-
-The webhook handler validates the PayU response hash before accepting a successful payment.
-
-For a real sandbox payment, use PayU's Test credentials/cards/UPI values documented in their Test Integration guide. UPI intent/in-app flows are not available in Test Mode.
+No open-source license has been added yet. Add the license that matches how you plan to distribute the project before publishing the repository publicly.
