@@ -56,6 +56,43 @@ class PostgresConnection:
     def close(self): self.raw.close()
 
 
+def refresh_demo_seed_decisions():
+    """Re-score bundled demo events so older deployments pick up new explanations/policy logic."""
+    if not SEED.exists():
+        return
+    try:
+        seed_events = json.loads(SEED.read_text(encoding="utf-8"))
+        seed_by_id = {str(e.get("id")): e for e in seed_events if e.get("id")}
+        if not seed_by_id:
+            return
+        conn = db()
+        rows = conn.execute("SELECT id FROM events WHERE id IN (" + ",".join("?" for _ in seed_by_id) + ")").fetchall()
+        conn.close()
+        for row in rows:
+            event = seed_by_id.get(str(row["id"]))
+            if event:
+                decision = hydrate(event)
+                conn = db()
+                conn.execute(
+                    """UPDATE events SET recovery_probability=?, risk_score=?, recommended_action=?,
+                       action_reason=?, risk_reason=?, delay_hours=?,
+                       lifecycle_status=? WHERE id=?""",
+                    (
+                        decision.recovery_probability, decision.risk_score, decision.recommended_action,
+                        decision.action_reason, decision.risk_reason, decision.delay_hours,
+                        "ESCALATION_REQUIRED" if decision.recommended_action == "escalate" else (
+                            "NO_ACTION" if decision.recommended_action == "do_nothing" else "RECOMMENDED"
+                        ),
+                        row["id"],
+                    ),
+                )
+                conn.commit()
+                conn.close()
+    except Exception:
+        # Demo-refresh should never prevent the API from starting.
+        return
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     init_db()
@@ -68,6 +105,9 @@ async def lifespan(app: FastAPI):
         for event in events:
             decision = hydrate(event)
             insert_event(event, decision, "m_demo")
+    else:
+        # Existing deployments keep the rows but receive the latest ML/policy explanations.
+        refresh_demo_seed_decisions()
     yield
 
 

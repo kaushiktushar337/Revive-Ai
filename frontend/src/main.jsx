@@ -3,7 +3,8 @@ import { createRoot } from 'react-dom/client';
 import './index.css';
 import reviveLogo from './assets/revive-ai-logo.png';
 
-const API = (import.meta.env.VITE_API_BASE_URL || '/api').replace(/\/$/, '');
+const configuredApiBase = String(import.meta.env.VITE_API_BASE_URL || '').trim().replace(/\/+$/, '');
+const API = configuredApiBase ? `${configuredApiBase}${configuredApiBase.endsWith('/api') ? '' : '/api'}` : '/api';
 const AUTH_KEY = 'revive_auth_token';
 const panel = 'surface-panel';
 const input = 'field-input';
