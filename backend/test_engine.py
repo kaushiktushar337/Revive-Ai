@@ -63,3 +63,22 @@ def test_payment_link_recommendation_includes_email_followup():
     decision = bounded_decision(base(event_type="invoice_overdue", days_overdue=7, previous_success_rate=0.80, prior_contacts=0), 0.70)
     assert decision.recommended_action == "send_payment_link"
     assert "personalized recovery email" in decision.action_reason
+
+
+def test_recovery_message_is_link_eligible_policy():
+    decision = bounded_decision(base(event_type="invoice_overdue", days_overdue=18, previous_success_rate=0.55, prior_contacts=2), 0.50)
+    assert decision.recommended_action == "send_recovery_message"
+
+
+def test_recovery_message_email_uses_created_payment_link():
+    import sqlite3
+    import main as main_module
+    conn = sqlite3.connect(':memory:')
+    conn.row_factory = sqlite3.Row
+    conn.execute('CREATE TABLE events (recommended_action TEXT, recovery_link_url TEXT, currency TEXT, amount REAL, customer TEXT)')
+    conn.execute('INSERT INTO events VALUES (?,?,?,?,?)', ('send_recovery_message', 'https://uat.payu.example/link-123', 'INR', 2500, 'Demo Customer'))
+    row = conn.execute('SELECT * FROM events').fetchone()
+    subject, body = main_module._email_content(row)
+    assert '2,500' in subject
+    assert 'https://uat.payu.example/link-123' in body
+    conn.close()

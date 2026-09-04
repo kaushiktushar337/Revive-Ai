@@ -852,7 +852,10 @@ def execute_event(event_id: str, merchant: sqlite3.Row = Depends(lambda authoriz
         status = "ESCALATION_REQUIRED"
         lifecycle = "ESCALATION_REQUIRED"
         message = "Agent escalated the case because the bounded policy requires human approval."
-    elif action == "send_payment_link":
+    elif action in {"send_payment_link", "send_recovery_message"}:
+        # Both direct payment-link actions and recovery-message actions create a payment link.
+        # The distinction is only the recommended follow-up: payment-link actions are link-first,
+        # while recovery messages are message-first but still include a frictionless pay link.
         gateway = event_gateway
         if gateway == "payu":
             result = create_payu_payment_link(
@@ -870,10 +873,13 @@ def execute_event(event_id: str, merchant: sqlite3.Row = Depends(lambda authoriz
             link_id = result.get("id")
             link_url = result.get("short_url")
             expires_at = result.get("expire_by")
-        action_payload = {"gateway": gateway, **result}
+        action_payload = {"gateway": gateway, **result, "recommended_action": action}
         status = "EXECUTED"
         lifecycle = "AWAITING_OUTCOME"
-        message = f"{gateway.upper()} recovery payment link created: {reference}"
+        if action == "send_recovery_message":
+            message = f"{gateway.upper()} recovery payment link created for the recommended recovery message: {reference}"
+        else:
+            message = f"{gateway.upper()} recovery payment link created: {reference}"
     else:
         status = "EXECUTED"
         lifecycle = "AWAITING_OUTCOME"
@@ -1350,12 +1356,12 @@ class RecoveryEmailIn(BaseModel):
 
 def _email_content(row: sqlite3.Row) -> tuple[str, str]:
     action = row["recommended_action"]
-    if action == "send_payment_link" and row["recovery_link_url"]:
-        subject = f"Payment link for your {row['currency']} {row['amount']:,.0f} invoice"
+    if row["recovery_link_url"] and action in {"send_payment_link", "send_recovery_message"}:
+        subject = f"Complete your {row['currency']} {row['amount']:,.0f} payment"
         body = (
             f"Hi {row['customer']},\n\n"
-            f"We noticed your recent payment for {row['currency']} {row['amount']:,.0f} did not complete. "
-            f"You can securely complete it here: {row['recovery_link_url']}\n\n"
+            f"We noticed your {row['currency']} {row['amount']:,.0f} payment is still outstanding. "
+            f"You can securely complete your payment here: {row['recovery_link_url']}\n\n"
             "If you have already paid, please ignore this message.\n\n"
             "Thanks"
         )
